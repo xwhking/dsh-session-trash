@@ -247,26 +247,24 @@ export function apply(ctx, config = {}) {
   }
 
   /**
-   * Keep every binned chat that has no log hidden.
+   * Keep every binned chat hidden.
    *
-   * A chat with no log is hidden by the archive flag and nothing else, and the
-   * platform offers an "undo" on archive. That undo is exactly what brought
-   * deleted chats back: the flag cleared, the chat relisted, the delete undone
-   * behind the recycle bin's back. A chat sitting in the bin must stay hidden,
-   * so an unarchive that did not come from restore or purge is reversed here.
-   *
-   * Chats whose log was moved are not touched: they are invisible without a
-   * flag, and re-archiving them would put them back in the archive list.
+   * The archive flag is what hides a chat whose Agent the platform still holds,
+   * and the platform offers an "undo" on archive. That undo is exactly what
+   * brought deleted chats back: the flag cleared, the chat relisted, the delete
+   * undone behind the recycle bin's back. A chat sitting in the bin must stay
+   * hidden, so an unarchive that did not come from restore or purge is reversed
+   * here.
    */
   async function enforceHidden() {
     await loadState()
     const workspaces = registry()
     if (workspaces === undefined) return
-    const hidden = state.items.filter((item) => item.fileless === true && !pending.has(item.sessionId))
-    if (hidden.length === 0) return
+    const binned = state.items.filter((item) => !pending.has(item.sessionId))
+    if (binned.length === 0) return
     const archived = await readArchivedIds()
     if (archived === undefined) return
-    for (const item of hidden) {
+    for (const item of binned) {
       if (archived.has(item.sessionId)) continue
       try {
         await workspaces.archiveSession(item.sessionId, { stopActivity: true })
@@ -368,23 +366,24 @@ export function apply(ctx, config = {}) {
   /**
    * Move one chat into the trash.
    *
-   * The log directory leaving the sessions root *is* the deletion: the
-   * platform's own session list is built from what is stored there, so once the
-   * log is gone the chat is no longer listed anywhere and cannot be resumed.
-   * Verified against the host's session list, not just the filesystem.
+   * Two separate things make a chat disappear, and which one applies depends on
+   * whether the platform still holds a live Agent for it:
    *
-   * The archive flag is used for two different jobs, and keeping them apart is
-   * what this function is really about:
+   *   - a chat that is no longer open (no live Agent) disappears as soon as its
+   *     log leaves the sessions root, because the session list is built from
+   *     what is stored there;
+   *   - a chat that is still open stays in that list even with its log gone,
+   *     because the live Agent is what carries it. Only the archive flag hides
+   *     it from the sidebar and its workspace tree.
    *
-   *   - stopping work: `archiveSession(..., { stopActivity: true })` ends any
-   *     run that would otherwise still be writing the log being moved;
-   *   - hiding a chat that has no log at all: a chat opened but never messaged
-   *     has no directory to move, so archiving is the only hide available.
+   * So a delete always archives — that is the only hide that works for a chat
+   * in use — and also moves the log, which is what makes the deletion real and
+   * what blocks any resume. The flag is deliberately left set: clearing it would
+   * put the chat straight back on screen while its Agent is alive.
    *
-   * For a chat with a log the flag is cleared again the moment the move lands:
-   * a chat whose log is gone needs no flag to be invisible, and leaving it set
-   * puts the chat in the platform's archive list, where its own "undo" would
-   * bring a deleted chat back.
+   * The archive flag is also what the platform's own "undo" clears, so a guard
+   * (`enforceHidden`) re-archives anything in the bin that gets unarchived from
+   * outside restore/purge.
    */
   async function trashSession(sessionId) {
     if (typeof sessionId !== 'string' || sessionId.length === 0) throw new Error('sessionId is required')
@@ -400,7 +399,12 @@ export function apply(ctx, config = {}) {
     const fileless = found === undefined
     pending.add(sessionId)
     try {
-      // Ends any work that would otherwise keep writing the log we move next.
+      // Whether the chat was hidden before this call, so a failed move can put
+      // the platform back exactly as it was.
+      const wasArchived = (await readArchivedIds())?.has(sessionId) === true
+
+      // Ends any work that would otherwise keep writing the log we move next,
+      // and hides a chat the platform still holds open.
       let archived = true
       try {
         await workspaces.archiveSession(sessionId, { stopActivity: true })
@@ -410,12 +414,18 @@ export function apply(ctx, config = {}) {
         await recordFailure('delete/archive', sessionId, error)
       }
 
-      if (!fileless) {
+      if (fileless) {
+        // Nothing on disk: the flag is the whole deletion, so it has to exist.
+        if (!archived && !(await isKnownSession(sessionId))) {
+          throw new Error('this chat has nothing stored to delete')
+        }
+      } else {
         try {
           await moveIntoBin(sessionId, found)
         } catch (error) {
-          // The move failed, so nothing was deleted: undo the hide, record nothing.
-          if (archived) {
+          // The move failed, so nothing was deleted: put the hide back the way
+          // it was and record nothing.
+          if (archived && !wasArchived) {
             try {
               await workspaces.unarchiveSession(sessionId)
             } catch {
@@ -424,15 +434,10 @@ export function apply(ctx, config = {}) {
           }
           throw new Error(`could not move this chat into the trash: ${String(error)}`)
         }
-      } else if (!archived && !(await isKnownSession(sessionId))) {
-        // Nothing to move, nothing hidden, and the platform does not even know
-        // the chat: refusing beats reporting a deletion that removed nothing.
-        throw new Error('this chat has nothing stored to delete')
       }
 
-      // Drop the accounting so no row survives on a workspace tree, and — for a
-      // chat that was moved — clear the archive flag so nothing lingers in the
-      // archive list with a working "undo".
+      // Drop the workspace accounting so no row survives on a workspace tree
+      // once the platform lets go of the Agent.
       const detachedFrom = []
       for (const workspace of workspaces.list()) {
         if (!workspace.sessionIds.includes(sessionId)) continue
@@ -442,15 +447,6 @@ export function apply(ctx, config = {}) {
         } catch (detachError) {
           ctx.logger?.warn?.(
             `session-trash: detaching '${sessionId}' from workspace '${workspace.id}' failed: ${String(detachError)}`,
-          )
-        }
-      }
-      if (!fileless) {
-        try {
-          await workspaces.unarchiveSession(sessionId)
-        } catch (unarchiveError) {
-          ctx.logger?.warn?.(
-            `session-trash: clearing the archive flag for '${sessionId}' failed: ${String(unarchiveError)}`,
           )
         }
       }
@@ -467,7 +463,7 @@ export function apply(ctx, config = {}) {
       }
       state.items = [item, ...state.items]
       await persist()
-      return { item: describeItem(item), alreadyTrashed: false, fileless }
+      return { item: describeItem(item), alreadyTrashed: false, fileless, archived }
     } finally {
       pending.delete(sessionId)
     }
@@ -566,12 +562,13 @@ export function apply(ctx, config = {}) {
             )
           }
         }
-        if (fileless) {
-          // Hidden by the archive flag alone and there is no log to remove, so
-          // clearing the flag now would put a permanently deleted chat back on
-          // screen until the next restart. Keep it hidden; nothing on disk
-          // remains, so a restart removes the last trace anyway.
-          ctx.logger?.info?.(`session-trash: '${sessionId}' had no log, kept archived so it stays hidden`)
+        // Clearing the flag is only safe when nothing can list the chat any
+        // more. A chat the platform still holds a live Agent for, or one that
+        // has no log at all, would come straight back, so it keeps the flag; a
+        // chat that is gone from both disk and memory gets it cleared so the
+        // archive set does not accumulate dead ids.
+        if (fileless || (await isKnownSession(sessionId))) {
+          ctx.logger?.info?.(`session-trash: '${sessionId}' stays archived; the platform can still list it`)
         } else if (detachFailed) {
           ctx.logger?.warn?.(
             `session-trash: kept '${sessionId}' archived because a workspace still accounts for it`,

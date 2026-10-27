@@ -105,16 +105,17 @@ async function main() {
     check('the log left the sessions root', findLogDir(sessionId) === undefined)
     check('the log is inside the bin', existsSync(join(binRoot, sessionId, 'session.v4.jsonl.zstd')))
     check('the chat is gone from the host list', (await isListed(sessionId)) === false)
-    check('the chat is not left archived', !archivedIds().includes(sessionId))
+    check('the chat is archived so no sidebar can list it', archivedIds().includes(sessionId))
     if (before !== null) {
       check('the bin copy is byte-identical', sha(join(binRoot, sessionId, 'session.v4.jsonl.zstd')) === before)
     }
 
-    // The platform's archive undo must not reach a chat whose log was moved.
+    // The platform's archive undo must not leave a binned chat visible.
     const undoAfterDelete = await call('simulateUndo', { sessionId })
     void undoAfterDelete
-    check('the platform undo does not bring the chat back', (await isListed(sessionId)) === false)
-    check('the chat is still in the bin after that undo', !archivedIds().includes(sessionId))
+    await new Promise((resolve) => setTimeout(resolve, 3500))
+    check('the bin re-hides a chat the platform undo released', archivedIds().includes(sessionId))
+    check('the chat is still in the bin after that undo', (await call('state')).body.items.some((item) => item.sessionId === sessionId))
 
     const again = await call('delete', { sessionId })
     check('deleting twice is idempotent', again.body.ok === true && again.body.alreadyTrashed === true, 'alreadyTrashed')
