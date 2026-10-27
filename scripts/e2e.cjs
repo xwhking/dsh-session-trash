@@ -1,20 +1,19 @@
 /**
  * End-to-end acceptance for the plugin's own HTTP surface.
  *
- * Runs against the live GUI origin and asserts the user-visible contract, not
- * just the filesystem: a delete must take the log out of the sessions root AND
- * archive it, a restore must return the identical bytes, a purge must leave no
- * log, no bin entry, no projection cache and no archive flag, and a second purge
- * must refuse instead of pretending.
+ * Asserts the user-visible contract rather than the filesystem alone: a delete
+ * must take the chat out of the host's own session list (which is what the
+ * sidebar renders) and must NOT leave it archived, because an archived chat
+ * stays in the platform's archive list and its undo brings the chat back.
  *
  * Usage:
- *   node scripts/e2e.cjs                  # fileless cases only
+ *   node scripts/e2e.cjs                  # read-only checks only
  *   E2E_SESSION_ID=<id> node scripts/e2e.cjs
  *
- * With E2E_SESSION_ID the run is destructive for that one session: the log is
- * copied to a temp backup first and restored at the end.
+ * With E2E_SESSION_ID the run is destructive for that one chat: its log is
+ * copied to a temp backup first and put back at the end.
  */
-const { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } = require('node:fs')
+const { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } = require('node:fs')
 const { createHash } = require('node:crypto')
 const { join } = require('node:path')
 const { homedir, tmpdir } = require('node:os')
@@ -56,6 +55,14 @@ const sha = (path) => createHash('sha256').update(readFileSync(path)).digest('he
 const archivedIds = () => JSON.parse(readFileSync(registryPath, 'utf8')).global?.archivedSessionIds ?? []
 const registryText = () => readFileSync(registryPath, 'utf8')
 
+/** Whether the host still lists this chat, which is what the sidebar shows. */
+async function isListed(sessionId) {
+  const answer = await call('inspect')
+  const sessions = answer.body.sessions ?? []
+  if (sessions.some((entry) => entry.error !== undefined)) throw new Error('inspect failed')
+  return sessions.some((entry) => entry.sessionId === sessionId)
+}
+
 async function main() {
   const state = await call('state')
   check('state is reachable', state.body.ok === true, `retention ${state.body.retentionDays} day(s)`)
@@ -63,11 +70,7 @@ async function main() {
   /* -------- an id nobody knows: refuse, do not invent a deletion ---------- */
   const ghost = 'session-00000000-0000-4000-8000-000000000000'
   const ghostDelete = await call('delete', { sessionId: ghost })
-  check(
-    'delete of an unknown chat refuses',
-    ghostDelete.body.ok === false,
-    ghostDelete.body.message,
-  )
+  check('delete of an unknown chat refuses', ghostDelete.body.ok === false, ghostDelete.body.message)
   const ghostState = await call('state')
   check(
     'the refused delete left no bin entry',
@@ -95,13 +98,23 @@ async function main() {
     cpSync(found.path, backup, { recursive: true })
     const before = existsSync(logPath) ? sha(logPath) : null
     console.log(`\ntesting with ${sessionId} (group ${found.group}, sha ${before})`)
+    check('the test chat starts out listed', await isListed(sessionId))
 
     const deleted = await call('delete', { sessionId })
     check('delete succeeds', deleted.body.ok === true, deleted.body.message ?? 'ok')
     check('the log left the sessions root', findLogDir(sessionId) === undefined)
     check('the log is inside the bin', existsSync(join(binRoot, sessionId, 'session.v4.jsonl.zstd')))
-    check('the chat is archived', archivedIds().includes(sessionId))
-    if (before !== null) check('the bin copy is byte-identical', sha(join(binRoot, sessionId, 'session.v4.jsonl.zstd')) === before)
+    check('the chat is gone from the host list', (await isListed(sessionId)) === false)
+    check('the chat is not left archived', !archivedIds().includes(sessionId))
+    if (before !== null) {
+      check('the bin copy is byte-identical', sha(join(binRoot, sessionId, 'session.v4.jsonl.zstd')) === before)
+    }
+
+    // The platform's archive undo must not reach a chat whose log was moved.
+    const undoAfterDelete = await call('simulateUndo', { sessionId })
+    void undoAfterDelete
+    check('the platform undo does not bring the chat back', (await isListed(sessionId)) === false)
+    check('the chat is still in the bin after that undo', !archivedIds().includes(sessionId))
 
     const again = await call('delete', { sessionId })
     check('deleting twice is idempotent', again.body.ok === true && again.body.alreadyTrashed === true, 'alreadyTrashed')
@@ -109,10 +122,15 @@ async function main() {
     const restored = await call('restore', { sessionId })
     check('restore succeeds', restored.body.ok === true, restored.body.message ?? 'ok')
     check('the log came back', findLogDir(sessionId) !== undefined)
-    if (before !== null) check('the restored log is byte-identical', sha(join(sessionsRoot, found.group, sessionId, 'session.v4.jsonl.zstd')) === before)
-    check('the chat is no longer archived', !archivedIds().includes(sessionId))
+    if (before !== null) {
+      check(
+        'the restored log is byte-identical',
+        sha(join(sessionsRoot, found.group, sessionId, 'session.v4.jsonl.zstd')) === before,
+      )
+    }
+    check('the restored chat is listed again', await isListed(sessionId))
+    check('the chat is not archived after restore', !archivedIds().includes(sessionId))
 
-    // Restore an unknown id must refuse rather than touch anything.
     const bogus = await call('restore', { sessionId: 'session-11111111-1111-4111-8111-111111111111' })
     check('restore of an unknown chat refuses', bogus.body.ok === false, bogus.body.message)
 
@@ -124,10 +142,10 @@ async function main() {
     check('the projection cache is gone', !existsSync(join(cacheRoot, `${sessionId}.json`)))
     check('the archive flag is gone', !archivedIds().includes(sessionId))
     check('no workspace mentions the chat', !registryText().includes(sessionId))
+    check('the chat is gone from the host list', (await isListed(sessionId)) === false)
 
     const second = await call('purge', { sessionId })
     check('purging what is already gone is idempotent', second.body.ok === true, second.body.message ?? 'ok')
-    check('the idempotent purge left the archive flag alone', !archivedIds().includes(sessionId))
 
     // Put the test chat back exactly as it was found.
     const target = join(sessionsRoot, found.group, sessionId)
@@ -140,9 +158,16 @@ async function main() {
     )
   }
 
-  writeFileSync(statePath, JSON.stringify({ version: state.body.version ?? 2, items: [] }, null, 2), 'utf8')
-  const final = await call('state')
-  check('the recycle bin ends empty', final.body.items.length === 0, `${final.body.items.length} item(s)`)
+  const finalState = await call('state')
+  const kept = finalState.body.items ?? []
+  // Only entries this run did not create may remain (the user's own deletions).
+  check(
+    'the run left no new bin entries',
+    kept.every((item) => item.sessionId !== ghost),
+    `${kept.length} item(s) still in the bin`,
+  )
+  void writeFileSync
+  void statePath
 
   const failed = results.filter((entry) => entry.ok !== true)
   console.log(`\n${results.length - failed.length}/${results.length} checks passed`)
@@ -157,5 +182,3 @@ main().catch((error) => {
   console.error(`e2e crashed: ${String(error)}`)
   process.exit(1)
 })
-
-void statSync

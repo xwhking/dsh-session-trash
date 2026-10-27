@@ -21,6 +21,8 @@ const STATE_VERSION = 2
 const DAY_MS = 24 * 60 * 60 * 1000
 const SWEEP_INTERVAL_MS = 5 * 60 * 1000
 const STARTUP_SWEEP_DELAY_MS = 4000
+/** How often a binned chat with no log is re-hidden after an outside unarchive. */
+const HIDE_GUARD_INTERVAL_MS = 2000
 
 function resolveHome() {
   const fromEnv = process.env.DSH_HOME
@@ -127,6 +129,8 @@ export function apply(ctx, config = {}) {
   let loaded = false
   /** Session ids with a live Agent that is actually running work right now. */
   const running = new Set()
+  /** Ids whose delete/restore/purge is in flight; the hide guard must not touch them. */
+  const pending = new Set()
 
   const registry = () => ctx.get('workspaceRegistry')
 
@@ -226,6 +230,54 @@ export function apply(ctx, config = {}) {
   }
 
   /**
+   * The durable archive set.
+   *
+   * `workspaceRegistry` exposes no reader for it and no change event, so the one
+   * durable copy is read directly. An unexpected shape returns undefined and the
+   * guard below simply does nothing.
+   */
+  async function readArchivedIds() {
+    try {
+      const parsed = JSON.parse(await readFile(join(home, 'storages', 'workspace.json'), 'utf8'))
+      const ids = parsed?.global?.archivedSessionIds
+      return Array.isArray(ids) ? new Set(ids) : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Keep every binned chat that has no log hidden.
+   *
+   * A chat with no log is hidden by the archive flag and nothing else, and the
+   * platform offers an "undo" on archive. That undo is exactly what brought
+   * deleted chats back: the flag cleared, the chat relisted, the delete undone
+   * behind the recycle bin's back. A chat sitting in the bin must stay hidden,
+   * so an unarchive that did not come from restore or purge is reversed here.
+   *
+   * Chats whose log was moved are not touched: they are invisible without a
+   * flag, and re-archiving them would put them back in the archive list.
+   */
+  async function enforceHidden() {
+    await loadState()
+    const workspaces = registry()
+    if (workspaces === undefined) return
+    const hidden = state.items.filter((item) => item.fileless === true && !pending.has(item.sessionId))
+    if (hidden.length === 0) return
+    const archived = await readArchivedIds()
+    if (archived === undefined) return
+    for (const item of hidden) {
+      if (archived.has(item.sessionId)) continue
+      try {
+        await workspaces.archiveSession(item.sessionId, { stopActivity: true })
+        ctx.logger?.info?.(`session-trash: re-hid '${item.sessionId}', which was unarchived while in the bin`)
+      } catch (error) {
+        ctx.logger?.warn?.(`session-trash: re-hiding '${item.sessionId}' failed: ${String(error)}`)
+      }
+    }
+  }
+
+  /**
    * Move one log directory, tolerating a transient Windows lock.
    *
    * A `rename` can fail with EBUSY/EPERM while the platform still holds the log
@@ -316,15 +368,23 @@ export function apply(ctx, config = {}) {
   /**
    * Move one chat into the trash.
    *
-   * The log directory moving out of the sessions root is the deletion: once it
-   * is gone from there, no listing and no resume can see the chat. The archive
-   * flag is set first only so the platform stops any work still writing that
-   * log, and it is rolled back if the move fails.
+   * The log directory leaving the sessions root *is* the deletion: the
+   * platform's own session list is built from what is stored there, so once the
+   * log is gone the chat is no longer listed anywhere and cannot be resumed.
+   * Verified against the host's session list, not just the filesystem.
    *
-   * Archiving is also the hide for a chat that never wrote a log at all (a chat
-   * opened but never messaged has no directory to move). That case is recorded
-   * as `fileless` and is still deletable — refusing it is what made deleting a
-   * fresh chat look broken.
+   * The archive flag is used for two different jobs, and keeping them apart is
+   * what this function is really about:
+   *
+   *   - stopping work: `archiveSession(..., { stopActivity: true })` ends any
+   *     run that would otherwise still be writing the log being moved;
+   *   - hiding a chat that has no log at all: a chat opened but never messaged
+   *     has no directory to move, so archiving is the only hide available.
+   *
+   * For a chat with a log the flag is cleared again the moment the move lands:
+   * a chat whose log is gone needs no flag to be invisible, and leaving it set
+   * puts the chat in the platform's archive list, where its own "undo" would
+   * bring a deleted chat back.
    */
   async function trashSession(sessionId) {
     if (typeof sessionId !== 'string' || sessionId.length === 0) throw new Error('sessionId is required')
@@ -337,19 +397,43 @@ export function apply(ctx, config = {}) {
     if (workspaces === undefined) throw new Error('workspace registry is unavailable')
 
     const title = await readTitle(sessionId)
-
-    // Ends any work that would otherwise keep writing the log we move next.
-    // A chat the platform will not archive is still deletable, so keep going.
-    let archived = true
-    let detachedFrom = []
+    const fileless = found === undefined
+    pending.add(sessionId)
     try {
-      await workspaces.archiveSession(sessionId, { stopActivity: true })
-    } catch (error) {
-      archived = false
-      ctx.logger?.warn?.(`session-trash: archiving '${sessionId}' failed, deleting anyway: ${String(error)}`)
-      await recordFailure('delete/archive', sessionId, error)
-      // Removing the workspace accounting is the other way DSH stops listing a
-      // chat, so a refused archive cannot leave a deleted chat on screen.
+      // Ends any work that would otherwise keep writing the log we move next.
+      let archived = true
+      try {
+        await workspaces.archiveSession(sessionId, { stopActivity: true })
+      } catch (error) {
+        archived = false
+        ctx.logger?.warn?.(`session-trash: archiving '${sessionId}' failed: ${String(error)}`)
+        await recordFailure('delete/archive', sessionId, error)
+      }
+
+      if (!fileless) {
+        try {
+          await moveIntoBin(sessionId, found)
+        } catch (error) {
+          // The move failed, so nothing was deleted: undo the hide, record nothing.
+          if (archived) {
+            try {
+              await workspaces.unarchiveSession(sessionId)
+            } catch {
+              // The original failure is the one worth reporting.
+            }
+          }
+          throw new Error(`could not move this chat into the trash: ${String(error)}`)
+        }
+      } else if (!archived && !(await isKnownSession(sessionId))) {
+        // Nothing to move, nothing hidden, and the platform does not even know
+        // the chat: refusing beats reporting a deletion that removed nothing.
+        throw new Error('this chat has nothing stored to delete')
+      }
+
+      // Drop the accounting so no row survives on a workspace tree, and — for a
+      // chat that was moved — clear the archive flag so nothing lingers in the
+      // archive list with a working "undo".
+      const detachedFrom = []
       for (const workspace of workspaces.list()) {
         if (!workspace.sessionIds.includes(sessionId)) continue
         try {
@@ -361,49 +445,32 @@ export function apply(ctx, config = {}) {
           )
         }
       }
-    }
-
-    let fileless = false
-    if (found === undefined) {
-      // Nothing was ever stored, so hiding it *is* the deletion — but only if it
-      // was hidden, or if the platform at least knows this chat (it is open in a
-      // tab). Recording an entry for an id nobody knows would report a deletion
-      // that removed nothing.
-      if (!archived && detachedFrom.length === 0 && !(await isKnownSession(sessionId))) {
-        throw new Error('this chat has nothing stored to delete')
-      }
-      fileless = true
-    } else {
-      try {
-        await moveIntoBin(sessionId, found)
-      } catch (error) {
-        // The move failed, so nothing was deleted: undo the hide and record nothing.
-        if (archived) {
-          try {
-            await workspaces.unarchiveSession(sessionId)
-          } catch {
-            // The original failure is the one worth reporting.
-          }
-        } else {
-          await attachBack(workspaces, detachedFrom, sessionId)
+      if (!fileless) {
+        try {
+          await workspaces.unarchiveSession(sessionId)
+        } catch (unarchiveError) {
+          ctx.logger?.warn?.(
+            `session-trash: clearing the archive flag for '${sessionId}' failed: ${String(unarchiveError)}`,
+          )
         }
-        throw new Error(`could not move this chat into the trash: ${String(error)}`)
       }
-    }
 
-    const now = Date.now()
-    const item = {
-      sessionId,
-      title,
-      group: found?.group ?? null,
-      fileless,
-      detachedFrom,
-      deletedAt: now,
-      expiresAt: now + retentionMs,
+      const now = Date.now()
+      const item = {
+        sessionId,
+        title,
+        group: found?.group ?? null,
+        fileless,
+        detachedFrom,
+        deletedAt: now,
+        expiresAt: now + retentionMs,
+      }
+      state.items = [item, ...state.items]
+      await persist()
+      return { item: describeItem(item), alreadyTrashed: false, fileless }
+    } finally {
+      pending.delete(sessionId)
     }
-    state.items = [item, ...state.items]
-    await persist()
-    return { item: describeItem(item), alreadyTrashed: false, fileless }
   }
 
   /** Undo a trashed chat while it is still inside the retention window. */
@@ -413,14 +480,19 @@ export function apply(ctx, config = {}) {
     if (workspaces === undefined) throw new Error('workspace registry is unavailable')
     const item = itemFor(sessionId)
     if (item === undefined) throw new Error('this chat is not in the recycle bin')
-    const moved = await moveOutOfBin(sessionId, item.group)
-    // A chat that was detached rather than archived goes back into the same
-    // workspaces; both calls are no-ops for a normal archived delete.
-    await attachBack(workspaces, item.detachedFrom, sessionId)
-    await workspaces.unarchiveSession(sessionId)
-    dropItem(sessionId)
-    await persist()
-    return { restored: true, filesReturned: moved }
+    pending.add(sessionId)
+    try {
+      const moved = await moveOutOfBin(sessionId, item.group)
+      await attachBack(workspaces, item.detachedFrom, sessionId)
+      // A `fileless` chat is hidden by this flag alone, so putting it back means
+      // clearing it; for a moved chat it is already clear and this is a no-op.
+      await workspaces.unarchiveSession(sessionId)
+      dropItem(sessionId)
+      await persist()
+      return { restored: true, filesReturned: moved }
+    } finally {
+      pending.delete(sessionId)
+    }
   }
 
   /**
@@ -476,37 +548,48 @@ export function apply(ctx, config = {}) {
     if (stray !== undefined) await rm(stray.path, { recursive: true, force: true })
     if (hasCache) await rm(cache, { force: true })
 
-    // The log is gone, so the archive flag is dead weight — clear it, and drop
-    // the workspace accounting with it. This is cleanup, never a restore: the
-    // archive flag is only cleared once no workspace still accounts for the
-    // chat, so a detach that failed can never leave it visible again.
-    const workspaces = registry()
-    if (workspaces !== undefined) {
-      let detachFailed = false
-      for (const workspace of workspaces.list()) {
-        if (!workspace.sessionIds.includes(sessionId)) continue
-        try {
-          await workspace.detachSession(sessionId)
-        } catch (error) {
-          detachFailed = true
-          ctx.logger?.warn?.(`session-trash: detaching '${sessionId}' from workspace '${workspace.id}' failed: ${String(error)}`)
+    pending.add(sessionId)
+    try {
+      // Fails to matter for a chat with no log, so the flag is only cleared when
+      // the chat is provably unreachable without it.
+      const workspaces = registry()
+      if (workspaces !== undefined) {
+        let detachFailed = false
+        for (const workspace of workspaces.list()) {
+          if (!workspace.sessionIds.includes(sessionId)) continue
+          try {
+            await workspace.detachSession(sessionId)
+          } catch (error) {
+            detachFailed = true
+            ctx.logger?.warn?.(
+              `session-trash: detaching '${sessionId}' from workspace '${workspace.id}' failed: ${String(error)}`,
+            )
+          }
+        }
+        if (fileless) {
+          // Hidden by the archive flag alone and there is no log to remove, so
+          // clearing the flag now would put a permanently deleted chat back on
+          // screen until the next restart. Keep it hidden; nothing on disk
+          // remains, so a restart removes the last trace anyway.
+          ctx.logger?.info?.(`session-trash: '${sessionId}' had no log, kept archived so it stays hidden`)
+        } else if (detachFailed) {
+          ctx.logger?.warn?.(
+            `session-trash: kept '${sessionId}' archived because a workspace still accounts for it`,
+          )
+        } else {
+          try {
+            await workspaces.unarchiveSession(sessionId)
+          } catch (error) {
+            ctx.logger?.warn?.(`session-trash: clearing archive membership for '${sessionId}' failed: ${String(error)}`)
+          }
         }
       }
-      if (detachFailed) {
-        ctx.logger?.warn?.(
-          `session-trash: kept '${sessionId}' archived because a workspace still accounts for it`,
-        )
-      } else {
-        try {
-          await workspaces.unarchiveSession(sessionId)
-        } catch (error) {
-          ctx.logger?.warn?.(`session-trash: clearing archive membership for '${sessionId}' failed: ${String(error)}`)
-        }
-      }
+      dropItem(sessionId)
+      await persist()
+      return { sessionId, removed: true, removedFromBin: inBin, removedStray: stray !== undefined, fileless }
+    } finally {
+      pending.delete(sessionId)
     }
-    dropItem(sessionId)
-    await persist()
-    return { sessionId, removed: true, removedFromBin: inBin, removedStray: stray !== undefined, fileless }
   }
 
   async function emptyTrash() {
@@ -566,6 +649,68 @@ export function apply(ctx, config = {}) {
 
   const ACTIONS = new Map([
     ['state', async () => await snapshot()],
+    [
+      /*
+       * Reproduce the platform's own archive "undo".
+       *
+       * The platform shows an undo on the archive toast, and pressing it is what
+       * brought deleted chats back. It is only reachable from the UI, so this
+       * mirrors it for tests: unarchive a chat that is sitting in the bin and
+       * watch whether the hide guard puts it back.
+       */
+      'simulateUndo',
+      async (body) => {
+        await loadState()
+        const workspaces = registry()
+        if (workspaces === undefined) throw new Error('workspace registry is unavailable')
+        if (itemFor(body.sessionId) === undefined) {
+          throw new Error('only a chat that is in the recycle bin can be used here')
+        }
+        await workspaces.unarchiveSession(body.sessionId)
+        return { sessionId: body.sessionId, unarchived: true, state: await snapshot() }
+      },
+    ],
+    [
+      'inspect',
+      async () => {
+        // Read-only ground truth for one chat: what the platform itself claims
+        // to have, which is what a listing is built from.
+        const sessions = []
+        const controller = ctx.get('sessionController')
+        if (controller !== undefined) {
+          try {
+            const listed = await controller.list({}, AbortSignal.timeout(8000))
+            for (const summary of listed?.items ?? []) {
+              sessions.push({
+                sessionId: summary.sessionId,
+                title: summary.projections?.values?.title ?? null,
+                blank: summary.blank === true,
+                agentAvailable: summary.agentAvailable === true,
+                running: summary.running === true,
+                updatedAt: summary.updatedAt,
+              })
+            }
+          } catch (error) {
+            sessions.push({ error: String(error) })
+          }
+        }
+        const workspaces = (registry()?.list() ?? []).map((workspace) => ({
+          id: workspace.id,
+          title: workspace.title,
+          sessionCount: workspace.sessionIds.length,
+        }))
+        return {
+          home,
+          sessionsRoot,
+          filesRoot,
+          retentionDays,
+          listedSessions: sessions.length,
+          sessions,
+          workspaces,
+          items: state.items.map(describeItem),
+        }
+      },
+    ],
     ['delete', async (body) => {
       const result = await trashSession(body.sessionId)
       return { ...result, state: await snapshot() }
@@ -637,7 +782,7 @@ export function apply(ctx, config = {}) {
   )
 
   /* ------------------------------------------------------------------ */
-  /* Expiry                                                              */
+  /* Expiry, and keeping binned chats hidden                            */
   /* ------------------------------------------------------------------ */
 
   const sweepTimer = setInterval(() => {
@@ -647,9 +792,19 @@ export function apply(ctx, config = {}) {
   }, SWEEP_INTERVAL_MS)
   sweepTimer.unref?.()
 
+  const guardTimer = setInterval(() => {
+    void enforceHidden().catch((error) => {
+      ctx.logger?.warn?.(`session-trash: keeping the bin hidden failed: ${String(error)}`)
+    })
+  }, HIDE_GUARD_INTERVAL_MS)
+  guardTimer.unref?.()
+
   const startupTimer = setTimeout(() => {
     void sweep().catch((error) => {
       ctx.logger?.warn?.(`session-trash: startup sweep failed: ${String(error)}`)
+    })
+    void enforceHidden().catch(() => {
+      // Same guard, immediately after the platform has finished starting up.
     })
   }, STARTUP_SWEEP_DELAY_MS)
   startupTimer.unref?.()
@@ -657,6 +812,7 @@ export function apply(ctx, config = {}) {
   ctx.effect(
     () => () => {
       clearInterval(sweepTimer)
+      clearInterval(guardTimer)
       clearTimeout(startupTimer)
     },
     'session-trash: expiry timers',
