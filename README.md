@@ -2,6 +2,9 @@
 
 给 DeepSeek Harness（DSH）用的一个小插件：**删除对话 → 进回收站 → 保留 3 天 → 到期自动永久删除**，期间随时可以恢复。
 
+> 注意要开启<img width="269" height="402" alt="image" src="https://github.com/user-attachments/assets/ccf1ee3c-3d80-473e-88e0-172930c5c14c" />
+> 不然还是能看到，如果在回收站删除以后就会不见了。
+
 ## 功能
 
 - **删除对话**：在左侧会话行的 `...` 菜单里多一项「删除对话」，点一下该对话立刻从所有列表消失。
