@@ -230,8 +230,10 @@ export function apply(ctx, config = {}) {
   /**
    * Move one chat into the trash.
    *
-   * Order matters: archive first (hides it and ends any work still writing the
-   * log), then move the directory, then record the deadline.
+   * The log directory moving out of the sessions root is the deletion: once it
+   * is gone from there, no listing and no resume can see the chat. The archive
+   * flag is set first only so the platform stops any work still writing that
+   * log, and it is rolled back if the move fails.
    */
   async function trashSession(sessionId) {
     if (typeof sessionId !== 'string' || sessionId.length === 0) throw new Error('sessionId is required')
@@ -239,20 +241,26 @@ export function apply(ctx, config = {}) {
     const existing = itemFor(sessionId)
     if (existing !== undefined) return { item: describeItem(existing), alreadyTrashed: true }
 
+    const found = await findSessionDir(sessionId)
+    if (found === undefined) {
+      throw new Error('this chat has no stored log left to delete (it may already be gone)')
+    }
+
     const workspaces = registry()
     if (workspaces === undefined) throw new Error('workspace registry is unavailable')
 
     const title = await readTitle(sessionId)
 
-    // Hides it from every surface and stops work that would keep writing the log.
+    // Ends any work that would otherwise keep writing the log we move next.
     await workspaces.archiveSession(sessionId, { stopActivity: true })
 
-    let group
+    let group = found.group
     try {
-      const moved = await moveIntoBin(sessionId)
-      group = moved.group
+      await rm(trashDirOf(sessionId), { recursive: true, force: true })
+      await mkdir(filesRoot, { recursive: true })
+      await rename(found.path, trashDirOf(sessionId))
     } catch (error) {
-      // Never leave a chat archived-but-not-in-the-bin: undo the hide.
+      // The move failed, so nothing was deleted: undo the hide and record nothing.
       try {
         await workspaces.unarchiveSession(sessionId)
       } catch {
@@ -274,7 +282,8 @@ export function apply(ctx, config = {}) {
     const workspaces = registry()
     if (workspaces === undefined) throw new Error('workspace registry is unavailable')
     const item = itemFor(sessionId)
-    const moved = await moveOutOfBin(sessionId, item?.group)
+    if (item === undefined) throw new Error('this chat is not in the recycle bin')
+    const moved = await moveOutOfBin(sessionId, item.group)
     await workspaces.unarchiveSession(sessionId)
     dropItem(sessionId)
     await persist()
@@ -284,9 +293,11 @@ export function apply(ctx, config = {}) {
   /**
    * Remove one trashed chat for good.
    *
-   * Nothing is running for a trashed chat — its log was moved out of the
-   * sessions root, so DSH can no longer resume it — which is why this needs no
-   * liveness gate. `dryRun` reports what would be removed.
+   * Success means the stored log is gone: either it was moved into the bin by
+   * this plugin, or an older build left it in the sessions root. When no log
+   * exists in either place, this refuses instead of reporting a deletion — and
+   * it never unarchives, because unarchiving is what would bring the chat back.
+   * `dryRun` reports what would be removed.
    */
   async function purgeSession(sessionId, options = {}) {
     await loadState()
@@ -295,6 +306,7 @@ export function apply(ctx, config = {}) {
     const stray = inBin ? undefined : await findSessionDir(sessionId)
     const cache = cacheFileOf(sessionId)
     const hasCache = await pathExists(cache)
+    const hasLog = inBin || stray !== undefined
 
     if (options.dryRun === true) {
       return {
@@ -302,26 +314,28 @@ export function apply(ctx, config = {}) {
         binDir: inBin ? binDir : null,
         strayPath: stray?.path ?? null,
         cachePath: hasCache ? cache : null,
+        hasLog,
         dryRun: true,
       }
+    }
+
+    if (!hasLog) {
+      throw new Error('no stored log found for this chat — nothing to delete')
+    }
+    if (stray !== undefined && running.has(sessionId)) {
+      throw new Error('this chat is running right now — stop it first, then delete again')
     }
 
     if (inBin) await rm(binDir, { recursive: true, force: true })
     // A chat trashed by an older build may still be sitting in the sessions
     // root; remove it there rather than silently leaving it behind.
-    if (stray !== undefined) {
-      if (running.has(sessionId)) throw new Error('this chat is running right now — stop it first, then delete again')
-      await rm(stray.path, { recursive: true, force: true })
-    }
+    if (stray !== undefined) await rm(stray.path, { recursive: true, force: true })
     if (hasCache) await rm(cache, { force: true })
 
+    // The log is gone, so the archive flag is dead weight — clear it, and drop
+    // the workspace accounting with it. This is cleanup, never a restore.
     const workspaces = registry()
     if (workspaces !== undefined) {
-      try {
-        await workspaces.unarchiveSession(sessionId)
-      } catch (error) {
-        ctx.logger?.warn?.(`session-trash: clearing archive membership for '${sessionId}' failed: ${String(error)}`)
-      }
       for (const workspace of workspaces.list()) {
         if (!workspace.sessionIds.includes(sessionId)) continue
         try {
@@ -330,10 +344,15 @@ export function apply(ctx, config = {}) {
           ctx.logger?.warn?.(`session-trash: detaching '${sessionId}' from workspace '${workspace.id}' failed: ${String(error)}`)
         }
       }
+      try {
+        await workspaces.unarchiveSession(sessionId)
+      } catch (error) {
+        ctx.logger?.warn?.(`session-trash: clearing archive membership for '${sessionId}' failed: ${String(error)}`)
+      }
     }
     dropItem(sessionId)
     await persist()
-    return { sessionId, removed: inBin || stray !== undefined }
+    return { sessionId, removed: true, removedFromBin: inBin, removedStray: stray !== undefined }
   }
 
   async function emptyTrash() {
