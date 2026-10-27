@@ -428,14 +428,15 @@ export function apply(ctx, config = {}) {
    *
    * Success means the chat can never be listed again: the stored log is gone
    * (either it was moved into the bin by this plugin, or an older build left it
-   * in the sessions root) and no workspace accounting survives. When no log
-   * exists in either place for a chat that did have one, this refuses instead of
-   * reporting a deletion — and it never unarchives a chat whose log is still
-   * around, because unarchiving is what would bring it back.
+   * in the sessions root), the projection cache is gone, and no workspace
+   * accounting survives. "Deleted forever" must always be possible, because a
+   * recycle-bin entry that cannot be cleared is worse than an extra rebuild, so
+   * a missing log is cleaned up instead of refused.
    *
-   * A `fileless` entry never had a log: nothing was ever written, so its only
-   * trace is the workspace entry and the archive flag, and dropping both is the
-   * whole removal. `dryRun` reports what would be removed.
+   * It still never resurrects a chat: the archive flag is only cleared after no
+   * workspace accounts for the chat any more, so a detach that failed leaves it
+   * hidden instead of visible. A `fileless` entry never had a log at all — its
+   * only trace is that same accounting. `dryRun` reports what would be removed.
    */
   async function purgeSession(sessionId, options = {}) {
     await loadState()
@@ -460,8 +461,10 @@ export function apply(ctx, config = {}) {
       }
     }
 
-    if (!hasLog && !fileless) {
-      throw new Error('no stored log found for this chat — nothing to delete')
+    if (!hasLog && !fileless && item === undefined) {
+      // Nothing is recorded and nothing is stored: an id this plugin never saw.
+      // Report it as already gone rather than inventing a deletion.
+      return { sessionId, removed: true, alreadyGone: true, removedFromBin: false, removedStray: false }
     }
     if (stray !== undefined && running.has(sessionId)) {
       throw new Error('this chat is running right now — stop it first, then delete again')

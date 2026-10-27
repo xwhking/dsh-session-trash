@@ -75,7 +75,11 @@ async function main() {
     `${ghostState.body.items.length} item(s)`,
   )
   const ghostPurge = await call('purge', { sessionId: ghost })
-  check('purging an unknown chat refuses', ghostPurge.body.ok === false, ghostPurge.body.message)
+  check(
+    'purging an unknown chat reports it as already gone',
+    ghostPurge.body.ok === true && ghostPurge.body.alreadyGone === true,
+    ghostPurge.body.message ?? 'alreadyGone',
+  )
 
   /* ------------------- a real chat: the whole lifecycle ------------------- */
   const sessionId = process.env.E2E_SESSION_ID
@@ -122,7 +126,8 @@ async function main() {
     check('no workspace mentions the chat', !registryText().includes(sessionId))
 
     const second = await call('purge', { sessionId })
-    check('purging what is already gone refuses', second.body.ok === false, second.body.message)
+    check('purging what is already gone is idempotent', second.body.ok === true, second.body.message ?? 'ok')
+    check('the idempotent purge left the archive flag alone', !archivedIds().includes(sessionId))
 
     // Put the test chat back exactly as it was found.
     const target = join(sessionsRoot, found.group, sessionId)
