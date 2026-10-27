@@ -1,0 +1,32 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Pack the bundle
+        run: npm pack
+
+      - name: Show pack contents
+        run: tar -tzf ./*.tgz
+
+      - name: Upload the tarball as a release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ./*.tgz
+          generate_release_notes: true
