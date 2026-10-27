@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Chat Trash",
+    "description": "Deleted chats go to a recycle bin, stay recoverable for 3 days, then are removed permanently."
+  }
+}

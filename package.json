@@ -1,0 +1,37 @@
+{
+  "name": "dsh-session-trash",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Delete chats into a recycle bin that restores them for 3 days and then removes them permanently.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "recycle-bin",
+    "session"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  }
+}

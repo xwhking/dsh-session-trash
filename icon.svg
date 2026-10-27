@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Chat Trash">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4b8bf5"/>
+      <stop offset="1" stop-color="#2a5fd0"/>
+    </linearGradient>
+  </defs>
+  <rect x="6" y="8" width="52" height="48" rx="12" fill="url(#g)"/>
+  <g fill="none" stroke="#ffffff" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M20 24h24"/>
+    <path d="M27 24v-4h10v4"/>
+    <path d="M23 24l2.6 20.5a3 3 0 0 0 3 2.6h6.8a3 3 0 0 0 3-2.6L41 24"/>
+    <path d="M29 30v11M35 30v11"/>
+  </g>
+</svg>
