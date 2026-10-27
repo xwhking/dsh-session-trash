@@ -30,6 +30,7 @@ window.__ModuleLoader__.load({
       'confirm.purge': '确定要彻底删除这条对话吗？该操作无法撤销。',
       'action.restored': '已恢复该对话',
       'action.purged': '已彻底删除',
+      'action.deleted': '已移入回收站',
       'time.day': '{n} 天',
       'time.hour': '{n} 小时',
       'time.minute': '{n} 分钟',
@@ -58,6 +59,7 @@ window.__ModuleLoader__.load({
       'confirm.purge': 'Permanently delete this chat? This cannot be undone.',
       'action.restored': 'Chat restored',
       'action.purged': 'Deleted permanently',
+      'action.deleted': 'Moved to the recycle bin',
       'time.day': '{n}d',
       'time.hour': '{n}h',
       'time.minute': '{n}m',
@@ -95,6 +97,9 @@ window.__ModuleLoader__.load({
 .stMenuRow:disabled{opacity:.5;cursor:default}
 .stMenuIcon{display:inline-flex;flex:none;align-items:center;justify-content:center;width:16px;height:16px}
 .stMenuLabel{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.stToastHost{position:fixed;left:50%;bottom:28px;z-index:2147483000;display:flex;flex-direction:column;align-items:center;gap:8px;transform:translateX(-50%);pointer-events:none}
+.stToast{max-width:min(560px,calc(100vw - 48px));box-sizing:border-box;padding:10px 16px;border-radius:10px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);box-shadow:0 6px 24px rgba(0,0,0,.18);font:inherit;font-size:13px;line-height:20px;text-align:center;white-space:pre-wrap;word-break:break-word}
+.stToastError{border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}
 `
 
     const pad2 = (value) => String(value).padStart(2, '0')
@@ -133,6 +138,31 @@ window.__ModuleLoader__.load({
       }
       if (!response.ok || body?.ok !== true) throw new Error(body?.message ?? `HTTP ${response.status}`)
       return body
+    }
+
+    /**
+     * Show a result the user can actually see.
+     *
+     * The menu row has no panel to report into, so a failure there used to be
+     * invisible — it only set a tooltip. Anything the user acted on gets an
+     * on-screen answer here, including the host's own reason for refusing.
+     */
+    function showToast(text, isError) {
+      let host = document.querySelector('.stToastHost')
+      if (host === null) {
+        host = document.createElement('div')
+        host.className = 'stToastHost'
+        document.body.appendChild(host)
+      }
+      const node = document.createElement('div')
+      node.className = isError === true ? 'stToast stToastError' : 'stToast'
+      node.setAttribute('role', isError === true ? 'alert' : 'status')
+      node.textContent = text
+      host.appendChild(node)
+      setTimeout(() => {
+        node.remove()
+        if (host.childElementCount === 0) host.remove()
+      }, isError === true ? 10000 : 4000)
     }
 
     function TrashIcon(props) {
@@ -356,7 +386,15 @@ window.__ModuleLoader__.load({
             if (typeof setMenuOpen === 'function') setMenuOpen(false)
             setBusy(true)
             void callHost('delete', { sessionId: props.sessionId })
-              .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)))
+              .then(() => {
+                setError(null)
+                showToast(t('action.deleted'), false)
+              })
+              .catch((reason) => {
+                const message = reason instanceof Error ? reason.message : String(reason)
+                setError(message)
+                showToast(t('panel.error', { message }), true)
+              })
               .finally(() => setBusy(false))
           },
         },

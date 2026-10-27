@@ -13,7 +13,7 @@
  * The UI talks to this half over one same-origin HTTP prefix
  * (`/session-trash/api`), the only endpoint this plugin adds.
  */
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { cp, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -119,6 +119,8 @@ export function apply(ctx, config = {}) {
   const filesRoot = join(trashRoot, 'files')
   const cacheFileOf = (id) => join(home, 'storages', 'session_projcache', 'sessions', `${id}.json`)
   const trashDirOf = (id) => join(filesRoot, id)
+  /** Last failure seen by this half, so a silent UI failure is still diagnosable. */
+  const lastErrorPath = join(trashRoot, 'last-error.json')
 
   /** The plugin's own durable state; `items` is the trash list. */
   let state = { version: STATE_VERSION, items: [] }
@@ -163,6 +165,65 @@ export function apply(ctx, config = {}) {
     })
   }
 
+  /**
+   * Keep the last failure on disk.
+   *
+   * The browser half can only surface one short line, and a menu row that fails
+   * used to fail silently, so the full reason and stack are written here where
+   * they can be read back later.
+   */
+  async function recordFailure(action, sessionId, error) {
+    try {
+      await mkdir(trashRoot, { recursive: true })
+      await writeFile(
+        lastErrorPath,
+        JSON.stringify(
+          {
+            at: new Date().toISOString(),
+            action,
+            sessionId: typeof sessionId === 'string' ? sessionId : null,
+            message: error instanceof Error ? error.message : String(error),
+            stack: error instanceof Error ? (error.stack ?? null) : null,
+          },
+          null,
+          2,
+        ),
+        'utf8',
+      )
+    } catch (writeError) {
+      ctx.logger?.warn?.(`session-trash: recording a failure failed: ${String(writeError)}`)
+    }
+  }
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  /**
+   * Move one log directory, tolerating a transient Windows lock.
+   *
+   * A `rename` can fail with EBUSY/EPERM while the platform still holds the log
+   * open, which resolves on its own a moment later. Retry first, then fall back
+   * to copying and removing so a locked file is still deletable.
+   */
+  async function moveDirectory(source, target) {
+    let lastError
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        await rename(source, target)
+        return 'moved'
+      } catch (error) {
+        lastError = error
+        if (attempt < 3) await sleep(150 * attempt)
+      }
+    }
+    try {
+      await cp(source, target, { recursive: true, force: true })
+      await rm(source, { recursive: true, force: true })
+      return 'copied'
+    } catch (copyError) {
+      throw new Error(`${String(lastError)} (copy fallback also failed: ${String(copyError)})`)
+    }
+  }
+
   /** Locate one live stored session as `{ group, path }` under the sessions root. */
   async function findSessionDir(sessionId) {
     let groups
@@ -202,15 +263,12 @@ export function apply(ctx, config = {}) {
     state.items = state.items.filter((item) => item.sessionId !== sessionId)
   }
 
-  /** Move one chat's log directory into the bin. Returns the group it came from. */
-  async function moveIntoBin(sessionId) {
-    const found = await findSessionDir(sessionId)
-    if (found === undefined) return { group: undefined, moved: false }
+  /** Move one chat's log directory into the bin. */
+  async function moveIntoBin(sessionId, found) {
     const target = trashDirOf(sessionId)
     await rm(target, { recursive: true, force: true })
     await mkdir(filesRoot, { recursive: true })
-    await rename(found.path, target)
-    return { group: found.group, moved: true }
+    return await moveDirectory(found.path, target)
   }
 
   /** Put one chat's log directory back where DSH expects it. */
@@ -223,7 +281,7 @@ export function apply(ctx, config = {}) {
     await mkdir(targetDir, { recursive: true })
     const target = join(targetDir, sessionId)
     await rm(target, { recursive: true, force: true })
-    await rename(source, target)
+    await moveDirectory(source, target)
     return true
   }
 
@@ -234,6 +292,11 @@ export function apply(ctx, config = {}) {
    * is gone from there, no listing and no resume can see the chat. The archive
    * flag is set first only so the platform stops any work still writing that
    * log, and it is rolled back if the move fails.
+   *
+   * Archiving is also the hide for a chat that never wrote a log at all (a chat
+   * opened but never messaged has no directory to move). That case is recorded
+   * as `fileless` and is still deletable — refusing it is what made deleting a
+   * fresh chat look broken.
    */
   async function trashSession(sessionId) {
     if (typeof sessionId !== 'string' || sessionId.length === 0) throw new Error('sessionId is required')
@@ -242,38 +305,54 @@ export function apply(ctx, config = {}) {
     if (existing !== undefined) return { item: describeItem(existing), alreadyTrashed: true }
 
     const found = await findSessionDir(sessionId)
-    if (found === undefined) {
-      throw new Error('this chat has no stored log left to delete (it may already be gone)')
-    }
-
     const workspaces = registry()
     if (workspaces === undefined) throw new Error('workspace registry is unavailable')
 
     const title = await readTitle(sessionId)
 
     // Ends any work that would otherwise keep writing the log we move next.
-    await workspaces.archiveSession(sessionId, { stopActivity: true })
-
-    let group = found.group
+    // A chat the platform will not archive is still deletable, so keep going.
+    let archived = true
     try {
-      await rm(trashDirOf(sessionId), { recursive: true, force: true })
-      await mkdir(filesRoot, { recursive: true })
-      await rename(found.path, trashDirOf(sessionId))
+      await workspaces.archiveSession(sessionId, { stopActivity: true })
     } catch (error) {
-      // The move failed, so nothing was deleted: undo the hide and record nothing.
+      archived = false
+      ctx.logger?.warn?.(`session-trash: archiving '${sessionId}' failed, deleting anyway: ${String(error)}`)
+      await recordFailure('delete/archive', sessionId, error)
+    }
+
+    let fileless = false
+    if (found === undefined) {
+      // Nothing was ever stored, so hiding it *is* the deletion.
+      fileless = true
+    } else {
       try {
-        await workspaces.unarchiveSession(sessionId)
-      } catch {
-        // The original failure is the one worth reporting.
+        await moveIntoBin(sessionId, found)
+      } catch (error) {
+        // The move failed, so nothing was deleted: undo the hide and record nothing.
+        if (archived) {
+          try {
+            await workspaces.unarchiveSession(sessionId)
+          } catch {
+            // The original failure is the one worth reporting.
+          }
+        }
+        throw new Error(`could not move this chat into the trash: ${String(error)}`)
       }
-      throw new Error(`could not move this chat into the trash: ${String(error)}`)
     }
 
     const now = Date.now()
-    const item = { sessionId, title, group, deletedAt: now, expiresAt: now + retentionMs }
+    const item = {
+      sessionId,
+      title,
+      group: found?.group ?? null,
+      fileless,
+      deletedAt: now,
+      expiresAt: now + retentionMs,
+    }
     state.items = [item, ...state.items]
     await persist()
-    return { item: describeItem(item), alreadyTrashed: false }
+    return { item: describeItem(item), alreadyTrashed: false, fileless }
   }
 
   /** Undo a trashed chat while it is still inside the retention window. */
@@ -293,14 +372,21 @@ export function apply(ctx, config = {}) {
   /**
    * Remove one trashed chat for good.
    *
-   * Success means the stored log is gone: either it was moved into the bin by
-   * this plugin, or an older build left it in the sessions root. When no log
-   * exists in either place, this refuses instead of reporting a deletion — and
-   * it never unarchives, because unarchiving is what would bring the chat back.
-   * `dryRun` reports what would be removed.
+   * Success means the chat can never be listed again: the stored log is gone
+   * (either it was moved into the bin by this plugin, or an older build left it
+   * in the sessions root) and no workspace accounting survives. When no log
+   * exists in either place for a chat that did have one, this refuses instead of
+   * reporting a deletion — and it never unarchives a chat whose log is still
+   * around, because unarchiving is what would bring it back.
+   *
+   * A `fileless` entry never had a log: nothing was ever written, so its only
+   * trace is the workspace entry and the archive flag, and dropping both is the
+   * whole removal. `dryRun` reports what would be removed.
    */
   async function purgeSession(sessionId, options = {}) {
     await loadState()
+    const item = itemFor(sessionId)
+    const fileless = item?.fileless === true
     const binDir = trashDirOf(sessionId)
     const inBin = await pathExists(binDir)
     const stray = inBin ? undefined : await findSessionDir(sessionId)
@@ -315,11 +401,12 @@ export function apply(ctx, config = {}) {
         strayPath: stray?.path ?? null,
         cachePath: hasCache ? cache : null,
         hasLog,
+        fileless,
         dryRun: true,
       }
     }
 
-    if (!hasLog) {
+    if (!hasLog && !fileless) {
       throw new Error('no stored log found for this chat — nothing to delete')
     }
     if (stray !== undefined && running.has(sessionId)) {
@@ -333,26 +420,36 @@ export function apply(ctx, config = {}) {
     if (hasCache) await rm(cache, { force: true })
 
     // The log is gone, so the archive flag is dead weight — clear it, and drop
-    // the workspace accounting with it. This is cleanup, never a restore.
+    // the workspace accounting with it. This is cleanup, never a restore: the
+    // archive flag is only cleared once no workspace still accounts for the
+    // chat, so a detach that failed can never leave it visible again.
     const workspaces = registry()
     if (workspaces !== undefined) {
+      let detachFailed = false
       for (const workspace of workspaces.list()) {
         if (!workspace.sessionIds.includes(sessionId)) continue
         try {
           await workspace.detachSession(sessionId)
         } catch (error) {
+          detachFailed = true
           ctx.logger?.warn?.(`session-trash: detaching '${sessionId}' from workspace '${workspace.id}' failed: ${String(error)}`)
         }
       }
-      try {
-        await workspaces.unarchiveSession(sessionId)
-      } catch (error) {
-        ctx.logger?.warn?.(`session-trash: clearing archive membership for '${sessionId}' failed: ${String(error)}`)
+      if (detachFailed) {
+        ctx.logger?.warn?.(
+          `session-trash: kept '${sessionId}' archived because a workspace still accounts for it`,
+        )
+      } else {
+        try {
+          await workspaces.unarchiveSession(sessionId)
+        } catch (error) {
+          ctx.logger?.warn?.(`session-trash: clearing archive membership for '${sessionId}' failed: ${String(error)}`)
+        }
       }
     }
     dropItem(sessionId)
     await persist()
-    return { sessionId, removed: true, removedFromBin: inBin, removedStray: stray !== undefined }
+    return { sessionId, removed: true, removedFromBin: inBin, removedStray: stray !== undefined, fileless }
   }
 
   async function emptyTrash() {
@@ -447,8 +544,9 @@ export function apply(ctx, config = {}) {
               res.end()
               return
             }
+            let body
             try {
-              const body = await readJsonBody(req)
+              body = await readJsonBody(req)
               const action = ACTIONS.get(body?.action)
               if (action === undefined) {
                 writeJson(res, 400, { ok: false, message: `unknown action "${String(body?.action ?? '')}"` })
@@ -457,6 +555,7 @@ export function apply(ctx, config = {}) {
               const value = await action(body ?? {})
               writeJson(res, 200, { ok: true, ...value })
             } catch (error) {
+              await recordFailure(body?.action ?? 'unknown', body?.sessionId, error)
               writeJson(res, 400, { ok: false, message: error instanceof Error ? error.message : String(error) })
             }
           },

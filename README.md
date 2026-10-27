@@ -74,10 +74,19 @@ plugin_manager  action: install_bundle
 ## 数据存放
 
 - 回收站记录：`~/.dsh/dsh-session-trash/state.json`
+- 回收站里的会话日志：`~/.dsh/dsh-session-trash/files/<会话ID>/`
 - 会话日志：`~/.dsh/sessions/<工作区>/<会话ID>/`
 - 投影缓存：`~/.dsh/storages/session_projcache/sessions/<会话ID>.json`
+- 最近一次失败的原因：`~/.dsh/dsh-session-trash/last-error.json`
 
-「删除」只在保留期内把记录移入回收站，会话日志不动；到期或「彻底删除」才真正删文件。
+「删除」＝把会话日志目录移出 `~/.dsh/sessions`，并标记归档（让 DSH 停掉可能还在写日志的任务）。
+移出之后 DSH 在任何列表里都看不到它，保留期内的「恢复」会把日志原样搬回去；到期或「彻底删除」才真正删文件。
+
+## 出问题时
+
+1. 界面会弹出红字说明原因（例如「彻底删除」时日志已不存在会直接拒绝，而不是假装删掉了）。
+2. 同样的原因连同调用栈会写到 `~/.dsh/dsh-session-trash/last-error.json`，装到别人机器上排查时可以直接看这个文件。
+3. 改完 `index.js` / `client.js` 后需要在插件列表里关掉再打开（或刷新页面），否则跑的还是旧代码。
 
 ## 安全说明
 
