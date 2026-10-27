@@ -22,6 +22,9 @@
     "recycle-bin",
     "session"
   ],
+  "scripts": {
+    "check": "node scripts/check-ids.cjs"
+  },
   "license": "MIT",
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },
