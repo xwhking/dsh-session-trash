@@ -1,10 +1,14 @@
 /**
  * Session Trash — Host half.
  *
- * Deleting a chat archives it (so every surface stops listing it) and records
- * it in a plugin-owned trash file. A trashed chat stays recoverable for
- * `retentionDays` and is then removed permanently: its stored log directory,
- * its projection cache, its archive membership and its workspace accounting.
+ * Deleting a chat moves its stored log directory out of the sessions root into
+ * this plugin's own trash folder, so DSH can no longer see it. A trashed chat
+ * stays recoverable for `retentionDays`; after that it is removed for good.
+ *
+ * Archiving is used alongside the move, for two reasons only: it is how DSH
+ * hides a Session from every listing surface, and `stopActivity` is how the
+ * platform ends work that would otherwise keep writing the log we are about to
+ * move. Restoring undoes both.
  *
  * The UI talks to this half over one same-origin HTTP prefix
  * (`/session-trash/api`), the only endpoint this plugin adds.
@@ -13,7 +17,7 @@ import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/p
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-const STATE_VERSION = 1
+const STATE_VERSION = 2
 const DAY_MS = 24 * 60 * 60 * 1000
 const SWEEP_INTERVAL_MS = 5 * 60 * 1000
 const STARTUP_SWEEP_DELAY_MS = 4000
@@ -111,11 +115,16 @@ export function apply(ctx, config = {}) {
       : join(home, 'sessions')
   const trashRoot = join(home, 'dsh-session-trash')
   const statePath = join(trashRoot, 'state.json')
+  /** Where a trashed chat's log directory actually lives while it sits in the bin. */
+  const filesRoot = join(trashRoot, 'files')
   const cacheFileOf = (id) => join(home, 'storages', 'session_projcache', 'sessions', `${id}.json`)
+  const trashDirOf = (id) => join(filesRoot, id)
 
   /** The plugin's own durable state; `items` is the trash list. */
   let state = { version: STATE_VERSION, items: [] }
   let loaded = false
+  /** Session ids with a live Agent that is actually running work right now. */
+  const running = new Set()
 
   const registry = () => ctx.get('workspaceRegistry')
 
@@ -154,7 +163,7 @@ export function apply(ctx, config = {}) {
     })
   }
 
-  /** Locate one stored session's directory under the sessions root. */
+  /** Locate one live stored session as `{ group, path }` under the sessions root. */
   async function findSessionDir(sessionId) {
     let groups
     try {
@@ -166,7 +175,7 @@ export function apply(ctx, config = {}) {
       if (!group.isDirectory()) continue
       const candidate = join(sessionsRoot, group.name, sessionId)
       try {
-        if ((await stat(candidate)).isDirectory()) return candidate
+        if ((await stat(candidate)).isDirectory()) return { group: group.name, path: candidate }
       } catch {
         // Not this group.
       }
@@ -193,7 +202,37 @@ export function apply(ctx, config = {}) {
     state.items = state.items.filter((item) => item.sessionId !== sessionId)
   }
 
-  /** Move one chat into the trash: hide it everywhere, then record the deadline. */
+  /** Move one chat's log directory into the bin. Returns the group it came from. */
+  async function moveIntoBin(sessionId) {
+    const found = await findSessionDir(sessionId)
+    if (found === undefined) return { group: undefined, moved: false }
+    const target = trashDirOf(sessionId)
+    await rm(target, { recursive: true, force: true })
+    await mkdir(filesRoot, { recursive: true })
+    await rename(found.path, target)
+    return { group: found.group, moved: true }
+  }
+
+  /** Put one chat's log directory back where DSH expects it. */
+  async function moveOutOfBin(sessionId, group) {
+    const source = trashDirOf(sessionId)
+    if (!(await pathExists(source))) return false
+    const resolvedGroup = group ?? (await findSessionDir(sessionId))?.group
+    if (resolvedGroup === undefined) throw new Error('cannot tell which workspace folder this chat came from')
+    const targetDir = join(sessionsRoot, resolvedGroup)
+    await mkdir(targetDir, { recursive: true })
+    const target = join(targetDir, sessionId)
+    await rm(target, { recursive: true, force: true })
+    await rename(source, target)
+    return true
+  }
+
+  /**
+   * Move one chat into the trash.
+   *
+   * Order matters: archive first (hides it and ends any work still writing the
+   * log), then move the directory, then record the deadline.
+   */
   async function trashSession(sessionId) {
     if (typeof sessionId !== 'string' || sessionId.length === 0) throw new Error('sessionId is required')
     await loadState()
@@ -202,13 +241,28 @@ export function apply(ctx, config = {}) {
 
     const workspaces = registry()
     if (workspaces === undefined) throw new Error('workspace registry is unavailable')
-    // Archiving hides the chat from every surface; stopActivity also ends any
-    // work that would otherwise keep writing its log while it sits in the bin.
+
+    const title = await readTitle(sessionId)
+
+    // Hides it from every surface and stops work that would keep writing the log.
     await workspaces.archiveSession(sessionId, { stopActivity: true })
 
+    let group
+    try {
+      const moved = await moveIntoBin(sessionId)
+      group = moved.group
+    } catch (error) {
+      // Never leave a chat archived-but-not-in-the-bin: undo the hide.
+      try {
+        await workspaces.unarchiveSession(sessionId)
+      } catch {
+        // The original failure is the one worth reporting.
+      }
+      throw new Error(`could not move this chat into the trash: ${String(error)}`)
+    }
+
     const now = Date.now()
-    const title = await readTitle(sessionId)
-    const item = { sessionId, title, deletedAt: now, expiresAt: now + retentionMs }
+    const item = { sessionId, title, group, deletedAt: now, expiresAt: now + retentionMs }
     state.items = [item, ...state.items]
     await persist()
     return { item: describeItem(item), alreadyTrashed: false }
@@ -219,28 +273,46 @@ export function apply(ctx, config = {}) {
     await loadState()
     const workspaces = registry()
     if (workspaces === undefined) throw new Error('workspace registry is unavailable')
+    const item = itemFor(sessionId)
+    const moved = await moveOutOfBin(sessionId, item?.group)
     await workspaces.unarchiveSession(sessionId)
     dropItem(sessionId)
     await persist()
-    return { restored: true }
+    return { restored: true, filesReturned: moved }
   }
 
   /**
-   * Remove one trashed chat for good. `dryRun` reports what would be removed,
-   * so the same path can be inspected without touching a log.
+   * Remove one trashed chat for good.
+   *
+   * Nothing is running for a trashed chat — its log was moved out of the
+   * sessions root, so DSH can no longer resume it — which is why this needs no
+   * liveness gate. `dryRun` reports what would be removed.
    */
   async function purgeSession(sessionId, options = {}) {
     await loadState()
-    const logDir = await findSessionDir(sessionId)
+    const binDir = trashDirOf(sessionId)
+    const inBin = await pathExists(binDir)
+    const stray = inBin ? undefined : await findSessionDir(sessionId)
     const cache = cacheFileOf(sessionId)
     const hasCache = await pathExists(cache)
+
     if (options.dryRun === true) {
-      return { sessionId, logDir: logDir ?? null, cachePath: hasCache ? cache : null, dryRun: true }
+      return {
+        sessionId,
+        binDir: inBin ? binDir : null,
+        strayPath: stray?.path ?? null,
+        cachePath: hasCache ? cache : null,
+        dryRun: true,
+      }
     }
-    if (ctx.get('agents')?.get(sessionId) !== undefined) {
-      throw new Error('refusing to purge a chat that is still running')
+
+    if (inBin) await rm(binDir, { recursive: true, force: true })
+    // A chat trashed by an older build may still be sitting in the sessions
+    // root; remove it there rather than silently leaving it behind.
+    if (stray !== undefined) {
+      if (running.has(sessionId)) throw new Error('this chat is running right now — stop it first, then delete again')
+      await rm(stray.path, { recursive: true, force: true })
     }
-    if (logDir !== undefined) await rm(logDir, { recursive: true, force: true })
     if (hasCache) await rm(cache, { force: true })
 
     const workspaces = registry()
@@ -261,7 +333,7 @@ export function apply(ctx, config = {}) {
     }
     dropItem(sessionId)
     await persist()
-    return { sessionId, logDir: logDir ?? null, removed: logDir !== undefined }
+    return { sessionId, removed: inBin || stray !== undefined }
   }
 
   async function emptyTrash() {
@@ -299,6 +371,7 @@ export function apply(ctx, config = {}) {
     return {
       sessionId: item.sessionId,
       title: item.title,
+      group: item.group ?? null,
       deletedAt: item.deletedAt,
       expiresAt: item.expiresAt,
       remainingMs: Math.max(0, item.expiresAt - Date.now()),
@@ -372,6 +445,21 @@ export function apply(ctx, config = {}) {
       'session-trash: api route',
     )
   })
+
+  /* ------------------------------------------------------------------ */
+  /* Liveness: only a genuinely running Agent blocks a destructive action */
+  /* ------------------------------------------------------------------ */
+
+  ctx.effect(
+    () =>
+      ctx.on('agent/status', (payload) => {
+        const id = payload?.agent?.id
+        if (typeof id !== 'string') return
+        if (payload?.status === 'running') running.add(id)
+        else running.delete(id)
+      }),
+    'session-trash: agent status',
+  )
 
   /* ------------------------------------------------------------------ */
   /* Expiry                                                              */
