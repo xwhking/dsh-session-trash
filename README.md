@@ -4,6 +4,7 @@
 
 > 注意要开启<img width="269" height="402" alt="image" src="https://github.com/user-attachments/assets/ccf1ee3c-3d80-473e-88e0-172930c5c14c" />
 > 不然还是能看到，如果在回收站删除以后就会不见了。
+> 如果删除了还能看到，重新启动就会不见了的
 
 ## 功能
 
