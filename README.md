@@ -87,6 +87,7 @@ plugin_manager  action: install_bundle
 1. 界面会弹出红字说明原因（例如「彻底删除」时日志已不存在会直接拒绝，而不是假装删掉了）。
 2. 同样的原因连同调用栈会写到 `~/.dsh/dsh-session-trash/last-error.json`，装到别人机器上排查时可以直接看这个文件。
 3. 改完 `index.js` / `client.js` 后需要在插件列表里关掉再打开（或刷新页面），否则跑的还是旧代码。
+4. `node scripts/e2e.cjs` 会对着正在跑的 GUI 把「删除 → 恢复 → 彻底删除」跑一遍并逐条报告；加 `E2E_SESSION_ID=<一个可以牺牲的会话ID>` 才会动真实日志（跑完自动还原）。
 
 ## 安全说明
 

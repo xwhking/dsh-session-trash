@@ -130,6 +130,22 @@ export function apply(ctx, config = {}) {
 
   const registry = () => ctx.get('workspaceRegistry')
 
+  /**
+   * Whether the platform knows this chat at all, live or in persistence.
+   *
+   * This is an existence question, never a liveness one: `agents.get` only means
+   * an Agent object exists, which is why it is not used to decide whether work is
+   * running. It is the right answer to "is this a real chat or a stray id".
+   */
+  async function isKnownSession(sessionId) {
+    try {
+      if (ctx.get('agents')?.get?.(sessionId) !== undefined) return true
+    } catch {
+      // Treat an unreadable agent table as "not known".
+    }
+    return (await findSessionDir(sessionId)) !== undefined
+  }
+
   async function loadState() {
     if (loaded) return state
     loaded = true
@@ -196,6 +212,18 @@ export function apply(ctx, config = {}) {
   }
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  /** Put a chat back into the workspaces a failed delete detached it from. */
+  async function attachBack(workspaces, workspaceIds, sessionId) {
+    for (const id of workspaceIds ?? []) {
+      try {
+        const workspace = workspaces.get(id)
+        if (workspace !== undefined) await workspace.attachSession(sessionId)
+      } catch (attachError) {
+        ctx.logger?.warn?.(`session-trash: re-attaching to workspace '${id}' failed: ${String(attachError)}`)
+      }
+    }
+  }
 
   /**
    * Move one log directory, tolerating a transient Windows lock.
@@ -313,17 +341,37 @@ export function apply(ctx, config = {}) {
     // Ends any work that would otherwise keep writing the log we move next.
     // A chat the platform will not archive is still deletable, so keep going.
     let archived = true
+    let detachedFrom = []
     try {
       await workspaces.archiveSession(sessionId, { stopActivity: true })
     } catch (error) {
       archived = false
       ctx.logger?.warn?.(`session-trash: archiving '${sessionId}' failed, deleting anyway: ${String(error)}`)
       await recordFailure('delete/archive', sessionId, error)
+      // Removing the workspace accounting is the other way DSH stops listing a
+      // chat, so a refused archive cannot leave a deleted chat on screen.
+      for (const workspace of workspaces.list()) {
+        if (!workspace.sessionIds.includes(sessionId)) continue
+        try {
+          await workspace.detachSession(sessionId)
+          detachedFrom.push(workspace.id)
+        } catch (detachError) {
+          ctx.logger?.warn?.(
+            `session-trash: detaching '${sessionId}' from workspace '${workspace.id}' failed: ${String(detachError)}`,
+          )
+        }
+      }
     }
 
     let fileless = false
     if (found === undefined) {
-      // Nothing was ever stored, so hiding it *is* the deletion.
+      // Nothing was ever stored, so hiding it *is* the deletion — but only if it
+      // was hidden, or if the platform at least knows this chat (it is open in a
+      // tab). Recording an entry for an id nobody knows would report a deletion
+      // that removed nothing.
+      if (!archived && detachedFrom.length === 0 && !(await isKnownSession(sessionId))) {
+        throw new Error('this chat has nothing stored to delete')
+      }
       fileless = true
     } else {
       try {
@@ -336,6 +384,8 @@ export function apply(ctx, config = {}) {
           } catch {
             // The original failure is the one worth reporting.
           }
+        } else {
+          await attachBack(workspaces, detachedFrom, sessionId)
         }
         throw new Error(`could not move this chat into the trash: ${String(error)}`)
       }
@@ -347,6 +397,7 @@ export function apply(ctx, config = {}) {
       title,
       group: found?.group ?? null,
       fileless,
+      detachedFrom,
       deletedAt: now,
       expiresAt: now + retentionMs,
     }
@@ -363,6 +414,9 @@ export function apply(ctx, config = {}) {
     const item = itemFor(sessionId)
     if (item === undefined) throw new Error('this chat is not in the recycle bin')
     const moved = await moveOutOfBin(sessionId, item.group)
+    // A chat that was detached rather than archived goes back into the same
+    // workspaces; both calls are no-ops for a normal archived delete.
+    await attachBack(workspaces, item.detachedFrom, sessionId)
     await workspaces.unarchiveSession(sessionId)
     dropItem(sessionId)
     await persist()
