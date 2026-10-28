@@ -8,7 +8,7 @@
  */
 const { argv } = process
 
-const origin = process.env.ST_ORIGIN || 'http://127.0.0.1:4468'
+const origin = process.env.ST_ORIGIN || 'http://127.0.0.1:1349'
 const action = argv[2] ?? 'state'
 const argument = argv[3]
 
@@ -40,3 +40,4 @@ async function main() {
 }
 
 void main()
+

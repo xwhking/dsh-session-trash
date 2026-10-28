@@ -104,6 +104,29 @@ async function pathExists(path) {
   }
 }
 
+/**
+ * What the hide guard should do for one binned chat.
+ *
+ * Split out as a pure function so the decision table can be tested without a
+ * running platform: the release only happens after the platform drops a chat's
+ * Agent, which nothing outside the process can force.
+ *
+ * `live`    — the platform still holds an Agent for the chat, so its row would
+ *             survive the missing log and the archive flag is the only hide.
+ * `archived`— the flag is currently set.
+ *
+ * - live + set      → leave it: the flag is doing the only job available.
+ * - live + cleared  → archive it: this is the platform's undo, and it must not
+ *                     be able to hold a deleted chat on screen.
+ * - not live + set  → release it: with no Agent and no log, nothing can list the
+ *                     chat, so the flag would only litter the archive list.
+ * - not live + clear→ nothing to do; just drop the marker.
+ */
+export function decideHideAction({ live, archived }) {
+  if (live) return archived ? 'leave' : 'archive'
+  return archived ? 'release' : 'clear-marker'
+}
+
 export function apply(ctx, config = {}) {
   const home = resolveHome()
   const retentionDays =
@@ -135,18 +158,35 @@ export function apply(ctx, config = {}) {
   const registry = () => ctx.get('workspaceRegistry')
 
   /**
+   * Whether the platform still holds a live Agent for this chat.
+   *
+   * This is the one fact the whole strategy turns on. A chat is carried by two
+   * independent things: its stored log, and the Agent object the platform keeps
+   * in memory once you have used it. Taking the log away removes the first, but
+   * the platform keeps listing the chat while the second exists — that is what
+   * "alive" means here, and it has nothing to do with what the sidebar shows.
+   *
+   * `agents.get` is the correct source for it. It is NOT a liveness test for
+   * "is this running work" — that is the `agent/status` set — but it is exactly
+   * the right question for "will this chat survive its log being moved".
+   */
+  function hasLiveAgent(sessionId) {
+    try {
+      return ctx.get('agents')?.get?.(sessionId) !== undefined
+    } catch {
+      return true
+    }
+  }
+
+  /**
    * Whether the platform knows this chat at all, live or in persistence.
    *
-   * This is an existence question, never a liveness one: `agents.get` only means
-   * an Agent object exists, which is why it is not used to decide whether work is
-   * running. It is the right answer to "is this a real chat or a stray id".
+   * An existence question, never a liveness one. It answers "is this a real chat
+   * or a stray id", which is what decides whether a delete that has nothing to
+   * remove should be reported as done or refused.
    */
   async function isKnownSession(sessionId) {
-    try {
-      if (ctx.get('agents')?.get?.(sessionId) !== undefined) return true
-    } catch {
-      // Treat an unreadable agent table as "not known".
-    }
+    if (hasLiveAgent(sessionId)) return true
     return (await findSessionDir(sessionId)) !== undefined
   }
 
@@ -247,32 +287,60 @@ export function apply(ctx, config = {}) {
   }
 
   /**
-   * Keep every binned chat hidden.
+   * Keep the bin honest: hide what must stay hidden, and stop hiding the rest.
    *
-   * The archive flag is what hides a chat whose Agent the platform still holds,
-   * and the platform offers an "undo" on archive. That undo is exactly what
-   * brought deleted chats back: the flag cleared, the chat relisted, the delete
-   * undone behind the recycle bin's back. A chat sitting in the bin must stay
-   * hidden, so an unarchive that did not come from restore or purge is reversed
-   * here.
+   * Two jobs, both driven by the same observation — the archive flag is only ever
+   * a stand-in for a live Agent.
+   *
+   * 1. Re-hide. A chat kept hidden by the fallback can be released by the
+   *    platform's own archive "undo", which is what users were hitting when a
+   *    deleted chat came back. Members that undo took hold of are flagged again.
+   * 2. Release. A fallback flag is dead weight the moment the platform lets go of
+   *    the chat: with no Agent and no log, nothing can list it, so it must not
+   *    sit in the platform's archive list. That is what keeps deleted chats out
+   *    of archive view even when they were in use at the time of deletion.
    */
   async function enforceHidden() {
     await loadState()
     const workspaces = registry()
     if (workspaces === undefined) return
-    const binned = state.items.filter((item) => !pending.has(item.sessionId))
-    if (binned.length === 0) return
+    const fallbackMembers = state.items.filter((item) => item.archiveFallback === true && !pending.has(item.sessionId))
+    if (fallbackMembers.length === 0) return
     const archived = await readArchivedIds()
     if (archived === undefined) return
-    for (const item of binned) {
-      if (archived.has(item.sessionId)) continue
+    let released = 0
+    for (const item of fallbackMembers) {
+      const action = decideHideAction({
+        live: hasLiveAgent(item.sessionId),
+        archived: archived.has(item.sessionId),
+      })
+      if (action === 'leave') continue
+      if (action === 'clear-marker') {
+        item.archiveFallback = false
+        continue
+      }
+      if (action === 'archive') {
+        try {
+          await workspaces.archiveSession(item.sessionId, { stopActivity: true })
+          ctx.logger?.info?.(`session-trash: re-hid '${item.sessionId}', which was unarchived while in the bin`)
+        } catch (error) {
+          ctx.logger?.warn?.(`session-trash: re-hiding '${item.sessionId}' failed: ${String(error)}`)
+        }
+        continue
+      }
+      // 'release': the platform let go, so the missing log hides it now.
       try {
-        await workspaces.archiveSession(item.sessionId, { stopActivity: true })
-        ctx.logger?.info?.(`session-trash: re-hid '${item.sessionId}', which was unarchived while in the bin`)
+        await workspaces.unarchiveSession(item.sessionId)
+        item.archiveFallback = false
+        released += 1
+        ctx.logger?.info?.(
+          `session-trash: released the archive flag for '${item.sessionId}', now hidden by its missing log alone`,
+        )
       } catch (error) {
-        ctx.logger?.warn?.(`session-trash: re-hiding '${item.sessionId}' failed: ${String(error)}`)
+        ctx.logger?.warn?.(`session-trash: releasing the archive flag for '${item.sessionId}' failed: ${String(error)}`)
       }
     }
+    if (released > 0) await persist()
   }
 
   /**
@@ -366,24 +434,20 @@ export function apply(ctx, config = {}) {
   /**
    * Move one chat into the trash.
    *
-   * Two separate things make a chat disappear, and which one applies depends on
-   * whether the platform still holds a live Agent for it:
+   * The log directory is the deletion. Nothing else is needed to hide a chat the
+   * platform has let go of: the sidebar renders each workspace as
+   * `sessionIds ∩ the platform's session list`, and that list is built from
+   * stored logs, so a moved log means no row anywhere.
    *
-   *   - a chat that is no longer open (no live Agent) disappears as soon as its
-   *     log leaves the sessions root, because the session list is built from
-   *     what is stored there;
-   *   - a chat that is still open stays in that list even with its log gone,
-   *     because the live Agent is what carries it. Only the archive flag hides
-   *     it from the sidebar and its workspace tree.
-   *
-   * So a delete always archives — that is the only hide that works for a chat
-   * in use — and also moves the log, which is what makes the deletion real and
-   * what blocks any resume. The flag is deliberately left set: clearing it would
-   * put the chat straight back on screen while its Agent is alive.
-   *
-   * The archive flag is also what the platform's own "undo" clears, so a guard
-   * (`enforceHidden`) re-archives anything in the bin that gets unarchived from
-   * outside restore/purge.
+   * One case needs more, and only one: a chat the platform still holds a live
+   * Agent for (`hasLiveAgent`) keeps its row even with the log gone, because the
+   * content it renders lives in memory. DSH exposes no way to drop that Agent —
+   * `sessionPersistence` has no delete and the Agent object has no
+   * `dispose`/`close` — so the only switch left is the archive flag. It is used
+   * strictly as a temporary fallback and recorded as such, so that
+   * `releaseStaleArchive` can clear it the moment the platform lets go and
+   * nothing carries the chat any more. A normal chat is therefore never archived
+   * at all, which is what keeps deleted chats out of the platform's archive list.
    */
   async function trashSession(sessionId) {
     if (typeof sessionId !== 'string' || sessionId.length === 0) throw new Error('sessionId is required')
@@ -396,36 +460,33 @@ export function apply(ctx, config = {}) {
     if (workspaces === undefined) throw new Error('workspace registry is unavailable')
 
     const title = await readTitle(sessionId)
-    const fileless = found === undefined
     pending.add(sessionId)
     try {
-      // Whether the chat was hidden before this call, so a failed move can put
-      // the platform back exactly as it was.
-      const wasArchived = (await readArchivedIds())?.has(sessionId) === true
-
-      // Ends any work that would otherwise keep writing the log we move next,
-      // and hides a chat the platform still holds open.
-      let archived = true
+      // Ends any work that would otherwise keep writing the log we move next.
+      // This is the only reason to archive a chat that is about to be moved: with
+      // `stopActivity` the platform stops its work and lets go of the log.
+      let archived = false
       try {
         await workspaces.archiveSession(sessionId, { stopActivity: true })
+        archived = true
       } catch (error) {
-        archived = false
-        ctx.logger?.warn?.(`session-trash: archiving '${sessionId}' failed: ${String(error)}`)
+        ctx.logger?.warn?.(`session-trash: archiving '${sessionId}' before the move failed: ${String(error)}`)
         await recordFailure('delete/archive', sessionId, error)
       }
 
-      if (fileless) {
-        // Nothing on disk: the flag is the whole deletion, so it has to exist.
-        if (!archived && !(await isKnownSession(sessionId))) {
-          throw new Error('this chat has nothing stored to delete')
+      if (found === undefined) {
+        // Nothing was ever written: the flag is the whole hide, so it has to
+        // exist, or there is no deletion to report.
+        if (!archived) {
+          if (!(await isKnownSession(sessionId))) throw new Error('this chat has nothing stored to delete')
+          throw new Error('the platform would not hide this chat, and it has no stored log to move')
         }
       } else {
         try {
           await moveIntoBin(sessionId, found)
         } catch (error) {
-          // The move failed, so nothing was deleted: put the hide back the way
-          // it was and record nothing.
-          if (archived && !wasArchived) {
+          // Nothing was deleted: put the platform back exactly as it was.
+          if (archived) {
             try {
               await workspaces.unarchiveSession(sessionId)
             } catch {
@@ -436,8 +497,8 @@ export function apply(ctx, config = {}) {
         }
       }
 
-      // Drop the workspace accounting so no row survives on a workspace tree
-      // once the platform lets go of the Agent.
+      // Drop the workspace accounting so no empty slot survives, and so a chat
+      // that comes back later does not land in an unrelated position.
       const detachedFrom = []
       for (const workspace of workspaces.list()) {
         if (!workspace.sessionIds.includes(sessionId)) continue
@@ -451,19 +512,39 @@ export function apply(ctx, config = {}) {
         }
       }
 
+      // The move is the deletion, so the flag has done its job. Keep it only
+      // when the platform still carries the chat in memory, and remember that it
+      // is temporary.
+      const liveAgent = hasLiveAgent(sessionId)
+      let archiveFallback = false
+      if (archived) {
+        if (liveAgent) {
+          archiveFallback = true
+        } else {
+          try {
+            await workspaces.unarchiveSession(sessionId)
+          } catch (unarchiveError) {
+            ctx.logger?.warn?.(
+              `session-trash: clearing the archive flag for '${sessionId}' failed: ${String(unarchiveError)}`,
+            )
+          }
+        }
+      }
+
       const now = Date.now()
       const item = {
         sessionId,
         title,
         group: found?.group ?? null,
-        fileless,
+        fileless: found === undefined,
+        archiveFallback,
         detachedFrom,
         deletedAt: now,
         expiresAt: now + retentionMs,
       }
       state.items = [item, ...state.items]
       await persist()
-      return { item: describeItem(item), alreadyTrashed: false, fileless, archived }
+      return { item: describeItem(item), alreadyTrashed: false, fileless: item.fileless, archiveFallback }
     } finally {
       pending.delete(sessionId)
     }
@@ -562,13 +643,13 @@ export function apply(ctx, config = {}) {
             )
           }
         }
-        // Clearing the flag is only safe when nothing can list the chat any
-        // more. A chat the platform still holds a live Agent for, or one that
-        // has no log at all, would come straight back, so it keeps the flag; a
-        // chat that is gone from both disk and memory gets it cleared so the
-        // archive set does not accumulate dead ids.
-        if (fileless || (await isKnownSession(sessionId))) {
-          ctx.logger?.info?.(`session-trash: '${sessionId}' stays archived; the platform can still list it`)
+        // Clear the flag only when nothing can carry the chat any more: no live
+        // Agent to keep listing it, and no logless state that needed the flag to
+        // begin with. Anything else keeps it, because clearing would relist a
+        // permanently deleted chat.
+        const carried = fileless || hasLiveAgent(sessionId)
+        if (carried) {
+          ctx.logger?.info?.(`session-trash: '${sessionId}' stays archived; the platform can still carry it`)
         } else if (detachFailed) {
           ctx.logger?.warn?.(
             `session-trash: kept '${sessionId}' archived because a workspace still accounts for it`,
@@ -628,6 +709,10 @@ export function apply(ctx, config = {}) {
       deletedAt: item.deletedAt,
       expiresAt: item.expiresAt,
       remainingMs: Math.max(0, item.expiresAt - Date.now()),
+      // Reported so the panel can say plainly whether the platform still holds
+      // this chat, which is the only case where it can appear anywhere.
+      fileless: item.fileless === true,
+      archiveFallback: item.archiveFallback === true,
     }
   }
 
@@ -648,30 +733,12 @@ export function apply(ctx, config = {}) {
     ['state', async () => await snapshot()],
     [
       /*
-       * Reproduce the platform's own archive "undo".
-       *
-       * The platform shows an undo on the archive toast, and pressing it is what
-       * brought deleted chats back. It is only reachable from the UI, so this
-       * mirrors it for tests: unarchive a chat that is sitting in the bin and
-       * watch whether the hide guard puts it back.
+       * Read-only ground truth for one chat: what the platform itself reports for
+       * it, which is the only way to check "is it really gone" without a browser.
+       * Used by the e2e script; it changes nothing.
        */
-      'simulateUndo',
-      async (body) => {
-        await loadState()
-        const workspaces = registry()
-        if (workspaces === undefined) throw new Error('workspace registry is unavailable')
-        if (itemFor(body.sessionId) === undefined) {
-          throw new Error('only a chat that is in the recycle bin can be used here')
-        }
-        await workspaces.unarchiveSession(body.sessionId)
-        return { sessionId: body.sessionId, unarchived: true, state: await snapshot() }
-      },
-    ],
-    [
       'inspect',
       async () => {
-        // Read-only ground truth for one chat: what the platform itself claims
-        // to have, which is what a listing is built from.
         const sessions = []
         const controller = ctx.get('sessionController')
         if (controller !== undefined) {
@@ -706,6 +773,27 @@ export function apply(ctx, config = {}) {
           workspaces,
           items: state.items.map(describeItem),
         }
+      },
+    ],
+    [
+      /*
+       * Reproduce the platform's own archive "undo".
+       *
+       * The platform shows an undo on the archive toast, and pressing it is what
+       * brought deleted chats back. It is only reachable from the UI, so this
+       * mirrors it for tests: unarchive a chat that is sitting in the bin and
+       * watch whether the hide guard puts it back.
+       */
+      'simulateUndo',
+      async (body) => {
+        await loadState()
+        const workspaces = registry()
+        if (workspaces === undefined) throw new Error('workspace registry is unavailable')
+        if (itemFor(body.sessionId) === undefined) {
+          throw new Error('only a chat that is in the recycle bin can be used here')
+        }
+        await workspaces.unarchiveSession(body.sessionId)
+        return { sessionId: body.sessionId, unarchived: true, state: await snapshot() }
       },
     ],
     ['delete', async (body) => {

@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-trash",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "type": "module",
   "description": "Delete chats into a recycle bin that restores them for 3 days and then removes them permanently.",
   "exports": {
@@ -23,7 +23,7 @@
     "session"
   ],
   "scripts": {
-    "check": "node scripts/check-ids.cjs && node scripts/check-dicts.cjs"
+    "check": "node scripts/check-ids.cjs && node scripts/check-dicts.cjs && node scripts/check-release-guard.cjs"
   },
   "license": "MIT",
   "dsh": {

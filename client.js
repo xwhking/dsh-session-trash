@@ -24,6 +24,9 @@ window.__ModuleLoader__.load({
       'panel.remaining': '剩余 {time}',
       'panel.expired': '即将删除',
       'panel.untitled': '未命名对话',
+      'panel.gone': '日志已移走，任何列表都看不到',
+      'panel.noLog': '没有落盘内容，重启后彻底消失',
+      'panel.stillLoaded': '你仍开着它，关闭后会彻底隐藏',
       'panel.loading': '正在读取回收站…',
       'panel.error': '操作失败：{message}',
       'confirm.emptyAll': '确定要彻底删除回收站中的全部对话吗？该操作无法撤销。',
@@ -53,6 +56,9 @@ window.__ModuleLoader__.load({
       'panel.remaining': '{time} left',
       'panel.expired': 'Deleting soon',
       'panel.untitled': 'Untitled chat',
+      'panel.gone': 'Log moved out; no list can show it',
+      'panel.noLog': 'Never written to disk; gone after a restart',
+      'panel.stillLoaded': 'Still open here; hidden once you close it',
       'panel.loading': 'Reading the recycle bin…',
       'panel.error': 'Failed: {message}',
       'confirm.emptyAll': 'Permanently delete every chat in the recycle bin? This cannot be undone.',
@@ -325,6 +331,17 @@ window.__ModuleLoader__.load({
                             'span',
                             { className: 'stRemaining' },
                             t('panel.remaining', { time: formatRemaining(item.expiresAt - now, t) }),
+                          ),
+                          // Says plainly whether anything can still carry the
+                          // chat, which is the only reason it could be listed.
+                          h(
+                            'span',
+                            null,
+                            item.archiveFallback === true
+                              ? t('panel.stillLoaded')
+                              : item.fileless === true
+                                ? t('panel.noLog')
+                                : t('panel.gone'),
                           ),
                         ),
                       ),

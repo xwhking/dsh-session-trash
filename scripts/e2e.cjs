@@ -18,7 +18,7 @@ const { createHash } = require('node:crypto')
 const { join } = require('node:path')
 const { homedir, tmpdir } = require('node:os')
 
-const ORIGIN = process.env.E2E_ORIGIN || 'http://127.0.0.1:4468'
+const ORIGIN = process.env.E2E_ORIGIN || 'http://127.0.0.1:1349'
 const API = `${ORIGIN}/session-trash/api`
 const home = process.env.DSH_HOME || join(homedir(), '.dsh')
 const sessionsRoot = join(home, 'sessions')
@@ -105,17 +105,12 @@ async function main() {
     check('the log left the sessions root', findLogDir(sessionId) === undefined)
     check('the log is inside the bin', existsSync(join(binRoot, sessionId, 'session.v4.jsonl.zstd')))
     check('the chat is gone from the host list', (await isListed(sessionId)) === false)
-    check('the chat is archived so no sidebar can list it', archivedIds().includes(sessionId))
+    // A cold chat is hidden by its missing log alone, so it must not be left in
+    // the platform's archive list at all.
+    check('no archive entry is left behind for a cold chat', !archivedIds().includes(sessionId))
     if (before !== null) {
       check('the bin copy is byte-identical', sha(join(binRoot, sessionId, 'session.v4.jsonl.zstd')) === before)
     }
-
-    // The platform's archive undo must not leave a binned chat visible.
-    const undoAfterDelete = await call('simulateUndo', { sessionId })
-    void undoAfterDelete
-    await new Promise((resolve) => setTimeout(resolve, 3500))
-    check('the bin re-hides a chat the platform undo released', archivedIds().includes(sessionId))
-    check('the chat is still in the bin after that undo', (await call('state')).body.items.some((item) => item.sessionId === sessionId))
 
     const again = await call('delete', { sessionId })
     check('deleting twice is idempotent', again.body.ok === true && again.body.alreadyTrashed === true, 'alreadyTrashed')
@@ -157,6 +152,45 @@ async function main() {
       'the test chat was restored from its backup',
       before === null || sha(join(target, 'session.v4.jsonl.zstd')) === before,
     )
+  }
+
+  /* --------------- a chat the platform still holds in memory -------------- */
+  const liveId = process.env.E2E_LIVE_SESSION_ID
+  if (liveId === undefined || liveId === '') {
+    console.log('\n(no E2E_LIVE_SESSION_ID: skipped the live-chat fallback case)')
+  } else {
+    const listed = await call('inspect')
+    const summary = (listed.body.sessions ?? []).find((entry) => entry.sessionId === liveId)
+    check('the live test chat is currently held by the platform', summary?.agentAvailable === true, JSON.stringify(summary?.title))
+    const liveFound = findLogDir(liveId)
+    if (liveFound === undefined) {
+      check('the live test chat has a log to move', false, 'no log directory')
+    } else {
+      const liveLog = join(liveFound.path, 'session.v4.jsonl.zstd')
+      const liveBackup = join(tmpdir(), 'session-trash-e2e-live', liveId)
+      rmSync(liveBackup, { recursive: true, force: true })
+      mkdirSync(liveBackup, { recursive: true })
+      cpSync(liveFound.path, liveBackup, { recursive: true })
+      const liveSha = existsSync(liveLog) ? sha(liveLog) : null
+
+      const liveDelete = await call('delete', { sessionId: liveId })
+      check('deleting a chat that is still open succeeds', liveDelete.body.ok === true, liveDelete.body.message ?? 'ok')
+      check('that delete reports the temporary archive fallback', liveDelete.body.archiveFallback === true)
+      check('its log still left the sessions root', findLogDir(liveId) === undefined)
+      check('it is therefore hidden from every list', archivedIds().includes(liveId))
+
+      // The platform's own undo must not be able to hold the chat visible.
+      await call('simulateUndo', { sessionId: liveId })
+      await new Promise((resolve) => setTimeout(resolve, 3500))
+      check('the bin re-hides it after the platform undo', archivedIds().includes(liveId))
+
+      const liveRestore = await call('restore', { sessionId: liveId })
+      check('the live chat restores', liveRestore.body.ok === true, liveRestore.body.message ?? 'ok')
+      check('its log came back', findLogDir(liveId) !== undefined)
+      check('its log is byte-identical', liveSha === null || sha(join(liveFound.path, 'session.v4.jsonl.zstd')) === liveSha)
+      check('it is no longer archived', !archivedIds().includes(liveId))
+      check('it is listed again', await isListed(liveId))
+    }
   }
 
   const finalState = await call('state')
