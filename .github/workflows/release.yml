@@ -22,6 +22,18 @@ jobs:
       - name: Pack the bundle
         run: npm pack
 
+      - name: Verify the packed bundle installs
+        run: |
+          set -e
+          mkdir -p /tmp/st-verify
+          tar -xzf ./*.tgz -C /tmp/st-verify
+          node -e "const fs=require('fs');const p='/tmp/st-verify/package/package.json';const b=fs.readFileSync(p);if(b[0]===0xEF&&b[1]===0xBB&&b[2]===0xBF){console.error('BOM in package.json');process.exit(1)};JSON.parse(b.toString('utf8'));console.log('package.json OK')"
+          test -f /tmp/st-verify/package/cordis.patch.yml
+          test -f /tmp/st-verify/package/index.js
+          test -f /tmp/st-verify/package/client.js
+          node --check /tmp/st-verify/package/index.js
+          node --check /tmp/st-verify/package/client.js
+
       - name: Show pack contents
         run: tar -tzf ./*.tgz
 
