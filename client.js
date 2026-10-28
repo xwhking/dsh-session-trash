@@ -135,6 +135,8 @@ window.__ModuleLoader__.load({
 .stToastError{border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}
 /* Deleted chats never render in the sidebar, at any archive filter setting. */
 [data-row-key][data-st-hidden]{display:none!important}
+/* An empty group header (e.g. 未分组 with only deleted chats) must not linger. */
+[data-row-key][data-st-group-hidden]{display:none!important}
 `
 
     /**
@@ -145,6 +147,11 @@ window.__ModuleLoader__.load({
      * that appear later (refresh, archive-filter change, host pushing a new list
      * with the chat still in it). Removing the attribute is what lets a restored
      * chat reappear.
+     *
+     * Also hides a group header whose visible sessions are all deleted: the
+     * ungrouped group is rendered as `data-row-key="workspace:"` (empty key),
+     * and the Host can keep listing a deleted live chat, so the header would
+     * otherwise stay behind with nothing under it.
      */
     function applyHidden() {
       for (const row of document.querySelectorAll('[data-row-key^="session:"]')) {
@@ -153,6 +160,27 @@ window.__ModuleLoader__.load({
           row.setAttribute('data-st-hidden', 'true')
         } else {
           row.removeAttribute('data-st-hidden')
+        }
+      }
+      // A workspace group header is a row with data-row-key="workspace:<key>";
+      // the ungrouped group has an empty key. Its session rows are siblings, not
+      // children, so walk forward from the header until the next group header.
+      for (const header of document.querySelectorAll('[data-row-key^="workspace:"]')) {
+        const key = header.getAttribute('data-row-key').slice('workspace:'.length)
+        if (key !== '') continue
+        let visible = 0
+        let cursor = header.nextElementSibling
+        while (cursor !== null && cursor.getAttribute('data-row-key')?.startsWith('workspace:') !== true) {
+          if (cursor.getAttribute('data-row-key')?.startsWith('session:') === true) {
+            const id = cursor.getAttribute('data-row-key').slice('session:'.length)
+            if (!hidden.has(id)) visible += 1
+          }
+          cursor = cursor.nextElementSibling
+        }
+        if (visible === 0) {
+          header.setAttribute('data-st-group-hidden', 'true')
+        } else {
+          header.removeAttribute('data-st-group-hidden')
         }
       }
     }

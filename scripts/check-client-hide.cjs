@@ -21,6 +21,9 @@ const checks = [
   ['the observer is disposed on unload', source.includes('observer.disconnect()')],
   ['the hidden set is synced from the Host on startup', source.includes("callHost('state')")],
   ['the row selector uses the official attribute', /data-row-key\^="session:"/.test(source)],
+  ['empty group headers are hidden too', source.includes('data-st-group-hidden')],
+  ['the ungrouped group key is empty', source.includes("key !== ''")],
+  ['group sessions are siblings, not children', source.includes('nextElementSibling')],
 ]
 
 let failed = 0

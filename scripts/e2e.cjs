@@ -18,7 +18,7 @@ const { createHash } = require('node:crypto')
 const { join } = require('node:path')
 const { homedir, tmpdir } = require('node:os')
 
-const ORIGIN = process.env.E2E_ORIGIN || 'http://127.0.0.1:1349'
+const ORIGIN = process.env.E2E_ORIGIN || 'http://127.0.0.1:8679'
 const API = `${ORIGIN}/session-trash/api`
 const home = process.env.DSH_HOME || join(homedir(), '.dsh')
 const sessionsRoot = join(home, 'sessions')

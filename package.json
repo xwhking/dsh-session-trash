@@ -1,6 +1,6 @@
-{
+﻿{
   "name": "dsh-session-trash",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "type": "module",
   "description": "Delete chats into a recycle bin that restores them for 3 days and then removes them permanently.",
   "exports": {
@@ -40,3 +40,4 @@
     }
   }
 }
+
