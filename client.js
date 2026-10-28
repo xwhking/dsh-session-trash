@@ -7,6 +7,33 @@ window.__ModuleLoader__.load({
 
     const NS = 'session-trash'
     const API = '/session-trash/api'
+    /**
+     * Session ids the user deleted, kept in the browser so the sidebar can stop
+     * rendering them regardless of how the Host still lists them.
+     *
+     * The sidebar is the only place that decides whether a row is drawn, and the
+     * Host has no way to drop a live session from memory. So "the entry must be
+     * gone at render time" has to be answered here: the Host still returns the
+     * chat for a while, the browser simply stops drawing it.
+     */
+    const HIDDEN_KEY = 'dsh-session-trash.hidden.v1'
+    function readHidden() {
+      try {
+        const parsed = JSON.parse(window.localStorage.getItem(HIDDEN_KEY) ?? '[]')
+        return new Set(Array.isArray(parsed) ? parsed.filter((id) => typeof id === 'string') : [])
+      } catch {
+        return new Set()
+      }
+    }
+    let hidden = readHidden()
+    function writeHidden() {
+      try {
+        window.localStorage.setItem(HIDDEN_KEY, JSON.stringify([...hidden]))
+      } catch {
+        // Storage being unavailable must not break deletion; it only loses the
+        // extra guarantee for a later refresh.
+      }
+    }
 
     const zh = {
       'menu.delete': '删除对话',
@@ -106,8 +133,51 @@ window.__ModuleLoader__.load({
 .stToastHost{position:fixed;left:50%;bottom:28px;z-index:2147483000;display:flex;flex-direction:column;align-items:center;gap:8px;transform:translateX(-50%);pointer-events:none}
 .stToast{max-width:min(560px,calc(100vw - 48px));box-sizing:border-box;padding:10px 16px;border-radius:10px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);box-shadow:0 6px 24px rgba(0,0,0,.18);font:inherit;font-size:13px;line-height:20px;text-align:center;white-space:pre-wrap;word-break:break-word}
 .stToastError{border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}
+/* Deleted chats never render in the sidebar, at any archive filter setting. */
+[data-row-key][data-st-hidden]{display:none!important}
 `
 
+    /**
+     * Stop a deleted chat from ever being drawn in the sidebar.
+     *
+     * `data-row-key="session:<id>"` is the official row attribute. Marking the
+     * row makes the CSS rule above hide it, and a MutationObserver catches rows
+     * that appear later (refresh, archive-filter change, host pushing a new list
+     * with the chat still in it). Removing the attribute is what lets a restored
+     * chat reappear.
+     */
+    function applyHidden() {
+      for (const row of document.querySelectorAll('[data-row-key^="session:"]')) {
+        const id = row.getAttribute('data-row-key').slice('session:'.length)
+        if (hidden.has(id)) {
+          row.setAttribute('data-st-hidden', 'true')
+        } else {
+          row.removeAttribute('data-st-hidden')
+        }
+      }
+    }
+
+    function markDeleted(sessionId) {
+      hidden.add(sessionId)
+      writeHidden()
+      applyHidden()
+    }
+    function markRestored(sessionId) {
+      hidden.delete(sessionId)
+      writeHidden()
+      applyHidden()
+    }
+
+    /**
+     * Hide deleted chats as soon as they are drawn, including rows the Host
+     * still returns for a live session after the log was moved.
+     */
+    function startRowGuard() {
+      applyHidden()
+      const observer = new MutationObserver(() => applyHidden())
+      observer.observe(document.body, { childList: true, subtree: true })
+      return () => observer.disconnect()
+    }
     const pad2 = (value) => String(value).padStart(2, '0')
 
     function formatDateTime(ms, locale) {
@@ -238,6 +308,10 @@ window.__ModuleLoader__.load({
           setBusy(true)
           try {
             const body = await callHost(action, payload)
+            // The row's visibility is decided here, so keep it in step with the
+            // Host: restored chats must become visible again, purged ones stay hidden.
+            if (action === 'restore' && typeof payload.sessionId === 'string') markRestored(payload.sessionId)
+            if (action === 'delete' && typeof payload.sessionId === 'string') markDeleted(payload.sessionId)
             if (body.state !== undefined) {
               setSnapshot({ retentionDays: body.state.retentionDays, items: body.state.items ?? [] })
             } else {
@@ -405,6 +479,9 @@ window.__ModuleLoader__.load({
             void callHost('delete', { sessionId: props.sessionId })
               .then(() => {
                 setError(null)
+                // The Host deleted it; the sidebar must stop drawing it now, not
+                // when the Host next forgets it.
+                markDeleted(props.sessionId)
                 showToast(t('action.deleted'), false)
               })
               .catch((reason) => {
@@ -432,6 +509,30 @@ window.__ModuleLoader__.load({
           document.head.appendChild(style)
           return () => style.remove()
         }, 'session-trash: styles')
+
+        // The sidebar stops drawing deleted chats at render time, including rows
+        // the Host still lists while a chat is live in memory.
+        ctx.effect(() => startRowGuard(), 'session-trash: hide deleted rows')
+
+        // Reconcile with the Host's bin on startup so a chat deleted in an older
+        // build is hidden too, and one restored elsewhere is unhidden here.
+        ctx.effect(() => {
+          let cancelled = false
+          void callHost('state')
+            .then((body) => {
+              if (cancelled) return
+              const ids = (body.items ?? []).map((item) => item.sessionId)
+              hidden = new Set(ids)
+              writeHidden()
+              applyHidden()
+            })
+            .catch(() => {
+              // Keep whatever localStorage already had; the panel will show the error.
+            })
+          return () => {
+            cancelled = true
+          }
+        }, 'session-trash: sync hidden set')
 
         /** `main` must exist before the sidebar row that selects it. */
         let mainReady = false
