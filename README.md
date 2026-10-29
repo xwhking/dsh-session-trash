@@ -172,6 +172,27 @@ plugin_manager  action: install_bundle
 
 > 从本地目录安装时，profile 里记的是 `link:<目录>`。**不要删除或移动那个目录**，否则插件失效。
 
+### 安装/更新时报 EPERM（Windows）
+
+```
+[ERR_PNPM_EPERM] [importPackage ...\node_modules\dsh-session-trash]
+EPERM: operation not permitted, rename '..._tmp_1234_1' -> '...\dsh-session-trash'
+```
+
+原因是 `link:` 安装会生成一个 **junction（目录联接）**，而 pnpm 更新时是「把临时目录 rename 覆盖过去」，NTFS 不允许这样替换 reparse point，于是每次都失败，临时目录被丢进 `node_modules\.ignored`。
+
+修复（只删 junction 本身，不会碰你的源码目录）：
+
+```bash
+node scripts/fix-link-install.cjs C:\Users\<你>\.dsh\profiles\desktop          # 先试运行
+node scripts/fix-link-install.cjs C:\Users\<你>\.dsh\profiles\desktop --yes    # 执行修复
+```
+
+然后重新 `install_bundle` 即可。
+
+> 脚本会先确认目标是 junction、删除后确认源目录仍在；如果那里是真目录，它会拒绝删除。
+> 也可以手动处理：在 `node_modules` 里对 `dsh-session-trash` 点右键删除（**不要**按住什么键递归删除），再清掉 `node_modules\.ignored`，然后重装。
+
 ## 配置
 
 打开 profile 的 `cordis.patch.yml`，找到 `session-trash` 那一行改 `config`：
@@ -197,6 +218,7 @@ plugin_manager  action: install_bundle
 | `README.md` | 安装与原理速查（本文件） |
 | `BLOG.md` | 完整分享文章：功能、实现、踩坑、下载 |
 | `scripts/e2e.cjs` | 端到端验收（见下） |
+| `scripts/fix-link-install.cjs` | 修复 Windows 上 `link:` 安装的 EPERM 报错 |
 | `scripts/check-*.cjs` | 静态检查：package.json 无 BOM、包名/模块 ID 一致、中英字典键一致、隐藏守卫决策表、客户端隐藏层 |
 
 ## 数据存放
