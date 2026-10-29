@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-trash",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "type": "module",
   "description": "Delete chats into a recycle bin that restores them for 3 days and then removes them permanently.",
   "exports": {
@@ -17,7 +17,9 @@
     "icon.svg",
     "README.md",
     "BLOG.md",
-    "LICENSE"
+    "LICENSE",
+    "scripts/fix-link-install.cjs",
+    "scripts/check-link-repair.cjs"
   ],
   "keywords": [
     "dsh-plugin",
